@@ -4,6 +4,8 @@ from cuml.common.mixins import CMajorInputTagMixin
 from cuml.common.input_utils import input_to_cuml_array
 from cuml.raft.common.handle cimport handle_t
 
+from libc.stdint cimport uint64_t
+
 
 cdef extern from "cuml/manifold/spectral.hpp" namespace "ML::Spectral":
 
