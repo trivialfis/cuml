@@ -1,4 +1,6 @@
 import numpy as np
+
+from cuml.common.sparsefuncs import extract_knn_graph
 from cuml.common.base import Base
 from cuml.common.mixins import CMajorInputTagMixin
 from cuml.common.input_utils import input_to_cuml_array
@@ -34,5 +36,11 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
     def fit(self, X, y=None):
         assert y is None
 
-        input_to_cuml_array(X, order='C', check_dtype=np.float32,
-                            convert_to_dtype=np.float32)
+        X_m, n_rows, n_dims = input_to_cuml_array(
+            X, order='C', check_dtype=np.float32, convert_to_dtype=np.float32
+        )
+        if n_rows <= 1:
+            raise ValueError("There needs to be more than 1 sample.")
+
+        (knn_indices_m, knn_indices_ctype), (knn_dists_m, knn_dists_ctype) =\
+            extract_knn_graph(X, True)
