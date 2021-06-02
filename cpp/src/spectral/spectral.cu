@@ -21,6 +21,8 @@
 #include <raft/sparse/linalg/spectral.cuh>
 #include <raft/spatial/knn/knn.hpp>
 
+#include <rmm/exec_policy.hpp>
+
 namespace raft {
 class handle_t;
 }
@@ -66,13 +68,26 @@ void fit_embedding(raft::handle_t const &handle, int n, int32_t *knn_indices,
     /*nnz=*/knn_coo.nnz, /*n=*/(value_idx)n, n_components, out, seed);
 }
 
-void fit_embedding(raft::handle_t const &handle, float const *X, int n_samples,
+void fit_embedding(raft::handle_t const &handle, float *X, int n_samples,
                    int n_features, int n_neighbors, int n_components,
                    float *out, uint64_t seed) {
   knn_graph<knn_indices_dense_t, float> knn_coo(n_samples, n_neighbors);
-  raft::spatial::knn::brute_force_knn(handle, ptrs, sizes, inputsA.d, inputsB.X,
-                                      inputsB.n, knn_coo.knn_indices,
+  manifold_dense_inputs_t<float> inputs(X, nullptr, n_samples, n_features);
+  std::vector<float *> ptrs(1);
+  std::vector<int> sizes(1);
+  ptrs[0] = inputs.X;
+  sizes[0] = inputs.n;
+
+  raft::spatial::knn::brute_force_knn(handle, ptrs, sizes, n_features, inputs.X,
+                                      inputs.n, knn_coo.knn_indices,
                                       knn_coo.knn_dists, n_neighbors);
+
+  rmm::device_uvector<int> knn_indices(n_samples * n_neighbors,
+                                       handle.get_stream());
+  thrust::copy_n(rmm::exec_policy(handle.get_stream_view()), knn_coo.knn_dists,
+                 knn_indices.begin());
+  fit_embedding(handle, n_samples, knn_indices.data(), knn_coo.knn_dists,
+                n_components, n_neighbors, out, seed);
 }
 }  // namespace Spectral
 }  // namespace ML
