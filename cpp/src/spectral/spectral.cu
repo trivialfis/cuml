@@ -19,6 +19,7 @@
 #include <raft/sparse/coo.cuh>
 #include <raft/sparse/linalg/symmetrize.cuh>
 #include <raft/sparse/linalg/spectral.cuh>
+#include <raft/spatial/knn/knn.hpp>
 
 namespace raft {
 class handle_t;
@@ -48,7 +49,7 @@ void fit_embedding(const raft::handle_t &handle, int *rows, int *cols,
                                         n_components, out, seed);
 }
 
-void fit_embedding(const raft::handle_t &handle, int n, int32_t *knn_indices,
+void fit_embedding(raft::handle_t const &handle, int n, int32_t *knn_indices,
                    float *knn_dists, int n_components, int n_neighbors,
                    float *out, uint64_t seed) {
   using value_t = float;
@@ -63,6 +64,15 @@ void fit_embedding(const raft::handle_t &handle, int n, int32_t *knn_indices,
     handle, /*rows=*/knn_coo.rows(), /*cols=*/knn_coo.cols(),
     /*vals=*/knn_coo.vals(),
     /*nnz=*/knn_coo.nnz, /*n=*/(value_idx)n, n_components, out, seed);
+}
+
+void fit_embedding(raft::handle_t const &handle, float const *X, int n_samples,
+                   int n_features, int n_neighbors, int n_components,
+                   float *out, uint64_t seed) {
+  knn_graph<knn_indices_dense_t, float> knn_coo(n_samples, n_neighbors);
+  raft::spatial::knn::brute_force_knn(handle, ptrs, sizes, inputsA.d, inputsB.X,
+                                      inputsB.n, knn_coo.knn_indices,
+                                      knn_coo.knn_dists, n_neighbors);
 }
 }  // namespace Spectral
 }  // namespace ML
