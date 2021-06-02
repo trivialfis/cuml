@@ -12,6 +12,6 @@ def test_spectral_knn():
     neigh = NearestNeighbors(n_neighbors=n_neighbors)
     neigh.fit(data)
     knn_graph = neigh.kneighbors_graph(data, mode="distance")
-    print(type(knn_graph), knn_graph.shape)
-    print(np.allclose(knn_graph.todense(), knn_graph.todense().T))
-    print("equal:", (knn_graph.T != knn_graph).nnz)
+
+    spectral = SpectralEmbedding(n_components=2)
+    spectral.fit(knn_graph)
