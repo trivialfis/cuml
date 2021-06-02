@@ -35,6 +35,17 @@ cdef extern from "cuml/manifold/spectral.hpp" namespace "ML::Spectral":
         float *out, uint64_t seed
     ) except +
 
+    void fit_embedding(
+        handle_t& handle,
+        float* X,
+        int n_samples,
+        int n_features,
+        int n_neighbors,
+        int n_components,
+        float* out,
+        uint64_t seed
+    ) except +
+
 
 def spectral_embedding(adjacency, *, n_components=8, random_state=None):
     pass
