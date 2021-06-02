@@ -25,6 +25,7 @@ cdef extern from "cuml/manifold/spectral.hpp" namespace "ML::Spectral":
         uint64_t seed
     ) except +
 
+    # pre-computed knn
     void fit_embedding(
         handle_t &handle,
         int n,
@@ -35,6 +36,7 @@ cdef extern from "cuml/manifold/spectral.hpp" namespace "ML::Spectral":
         float *out, uint64_t seed
     ) except +
 
+    # dense input
     void fit_embedding(
         handle_t& handle,
         float* X,
@@ -57,6 +59,7 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
         n_components,
         affinity="nearest_neighbors",
         random_state=None,
+        n_neighbors=None
         verbose=False,
         output_type=None,
         handle=None,
@@ -65,6 +68,14 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
 
         self.n_components = n_components
         self.affinity = affinity
+
+        if self.affinity not in {
+            "nearest_neighbors", "precomputed", "precomputed_nearest_neighbors"
+        }:
+            raise ValueError("Unsupported affinity type: %s".format(self.affinity))
+
+        self.n_neighbors = n_neighbors
+
         if isinstance(random_state, np.uint64):
             self.random_state = random_state
         else:
@@ -75,39 +86,56 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             else:
                 rs = np.random.RandomState(random_state)
 
-            self.random_state = rs.randint(low=0,
-                                           high=np.iinfo(np.uint64).max,
-                                           dtype=np.uint64)
-
-        super()
+            self.random_state = rs.randint(
+                low=0, high=np.iinfo(np.uint64).max, dtype=np.uint64
+            )
 
     def fit(self, X, y=None):
         assert y is None
-        self.n_rows = X.shape[0]
-        n_neighbors = X.data.reshape((self.n_rows, -1)).shape[1]
-
-        if self.n_rows <= 1:
-            raise ValueError("There needs to be more than 1 sample.")
-
-        (knn_indices_m, knn_indices_ctype), (knn_dists_m, knn_dists_ctype) =\
-            extract_knn_graph(X, True, True)
-
-        cdef uintptr_t knn_indices_raw = knn_indices_ctype or 0
-        cdef uintptr_t knn_dists_raw = knn_dists_ctype or 0
         cdef handle_t * handle = <handle_t*> < size_t > self.handle.getHandle()
-
+        self.n_rows = X.shape[0]
         self.embedding_ = CumlArray.zeros(
             (self.n_rows, self.n_components), order="C", dtype=np.float32
         )
-
         cdef uintptr_t embed_raw = self.embedding_.ptr
-        fit_embedding(
-            handle[0],
-            self.n_rows,
-            <int*> knn_indices_raw,
-            <float*> knn_dists_raw,
-            self.n_components,
-            n_neighbors,
-            <float*> embed_raw,
-            self.random_state
-        )
+
+        if self.affinity == "nearest_neighbors":
+            X_m, n_rows, n_dims = input_to_cuml_array(
+                X, order='C', check_dtype=np.float32, convert_to_dtype=True
+            )
+            assert n_rows == X.shape[0]
+            assert n_dims == X.shape[1]
+            fit_embedding(
+                handle,
+                X_m,
+                X.shape[0],
+                X.shape[1],
+                self.n_neighbors,
+                self.n_components,
+                <float*> embed_raw,
+                self.random_state
+            )
+        elif self.affinity == "precomputed":
+            pass
+        elif self.affinity == "precomputed_nearest_neighbors":
+            n_neighbors = X.data.reshape((self.n_rows, -1)).shape[1]
+
+            if self.n_rows <= 1:
+                raise ValueError("There needs to be more than 1 sample.")
+
+            (knn_indices_m, knn_indices_ctype), (knn_dists_m, knn_dists_ctype) =\
+                extract_knn_graph(X, True, True)
+
+            cdef uintptr_t knn_indices_raw = knn_indices_ctype or 0
+            cdef uintptr_t knn_dists_raw = knn_dists_ctype or 0
+
+                     fit_embedding(
+                handle[0],
+                self.n_rows,
+                <int*> knn_indices_raw,
+                <float*> knn_dists_raw,
+                self.n_components,
+                n_neighbors,
+                <float*> embed_raw,
+                self.random_state
+            )
