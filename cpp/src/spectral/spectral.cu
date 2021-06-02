@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <cuml/manifold/common.hpp>
+#include <cuml/manifold/spectral.hpp>
 
 #include <raft/sparse/coo.cuh>
 #include <raft/sparse/linalg/symmetrize.cuh>
