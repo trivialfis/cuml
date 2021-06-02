@@ -72,12 +72,8 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
 
     def fit(self, X, y=None):
         assert y is None
-
-        # X_m, self.n_rows, n_dims = input_to_cuml_array(
-        #     X, order='C', check_dtype=np.float32, convert_to_dtype=np.float32
-        # )
         self.n_rows = X.shape[0]
-        n_neighbors = X.shape[1]
+        n_neighbors = X.data.reshape((self.n_rows, -1)).shape[1]
 
         if self.n_rows <= 1:
             raise ValueError("There needs to be more than 1 sample.")

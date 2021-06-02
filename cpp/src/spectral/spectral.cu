@@ -51,9 +51,6 @@ void fit_embedding(const raft::handle_t &handle, int *rows, int *cols,
 void fit_embedding(const raft::handle_t &handle, int n, int32_t *knn_indices,
                    float *knn_dists, int n_components, int n_neighbors,
                    float *out, uint64_t seed) {
-  manifold_precomputed_knn_inputs_t<int32_t, float> inputs{
-    knn_indices, knn_dists, /*X=*/nullptr, nullptr,
-    /*n=*/0,     /*d=*/0,   n_neighbors};
   using value_t = float;
   using value_idx = int32_t;
   raft::sparse::COO<value_t, value_idx> knn_coo(handle.get_device_allocator(),
