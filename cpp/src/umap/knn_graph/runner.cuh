@@ -28,7 +28,7 @@ using namespace ML;
 
 /**
   * @brief This function performs a k-nearest neighbors against
-  *        the input algorithm using the specified knn algorithm. 
+  *        the input algorithm using the specified knn algorithm.
   *        Only algorithm supported at the moment is brute force
   *        knn primitive.
   * @tparam value_idx: Type of knn indices matrix. Usually an integral type.
