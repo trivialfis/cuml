@@ -6,6 +6,7 @@ from cuml.common.mixins import CMajorInputTagMixin
 from cuml.common.input_utils import input_to_cuml_array
 from cuml.raft.common.handle cimport handle_t
 
+from libc.stdint cimport uintptr_t
 from libc.stdint cimport uint64_t
 
 
@@ -48,4 +49,3 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
         cdef uintptr_t knn_indices_raw = knn_indices_ctype or 0
         cdef uintptr_t knn_dists_raw = knn_dists_ctype or 0
         cdef handle_t* handle = <handle_t*> <size_t> self.handle.getHandle()
-        fit_embedding(*handle, )
