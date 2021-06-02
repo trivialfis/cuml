@@ -48,23 +48,22 @@ void fit_embedding(const raft::handle_t &handle, int *rows, int *cols,
 
 void fit_embedding(const raft::handle_t &handle,
                    knn_indices_dense_t *knn_indices, float *knn_dists,
-                   int n_components, float *out, uint64_t seed) {
+                   int n_components, int n_neighbors, float *out,
+                   uint64_t seed) {
   manifold_precomputed_knn_inputs_t<knn_indices_dense_t, float> inputs{
-    knn_indices, knn_dists, X, nullptr, n, d, n_neighbors;
+    knn_indices, knn_dists, /*X=*/nullptr, nullptr, /*n=*/0, /*d=*/0, n_neighbors
   };
   using value_t = float;
   using value_idx = int64_t;
 
-  knn_graph<value_idx, value_t> knn_graph(inputs.n, k);
+  knn_graph<value_idx, value_t> knn_graph(inputs.n, n_neighbors);
 
   knn_graph.knn_indices = knn_indices;
   knn_graph.knn_dists = knn_dists;
 
-  kNNGraph::run<value_idx, value_t, manifold_precomputed_knn_inputs_t<knn_indices_dense_t, float>>(
-    handle, inputs, inputs, knn_graph, k, params, d_alloc, stream);
-
-  raft::sparse::spectral::fit_embedding(handle, rows, cols, vals, nnz, n,
-                                        n_components, out, seed);
+  raft::sparse::spectral::fit_embedding(
+    handle, /*rows=*/nullptr, /*cols=*/nullptr, /*vals=*/knn_dists,
+    /*nnz=*/0, /*n=*/0, n_components, out, seed);
 }
 }  // namespace Spectral
 }  // namespace ML
