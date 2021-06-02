@@ -55,24 +55,16 @@ void fit_embedding(const raft::handle_t &handle, int n, int32_t *knn_indices,
     /*n=*/0,     /*d=*/0,   n_neighbors};
   using value_t = float;
   using value_idx = int32_t;
-
-  knn_graph<value_idx, value_t> knn_graph(inputs.n, n_neighbors);
-
-  knn_graph.knn_indices = knn_indices;
-  knn_graph.knn_dists = knn_dists;
-
-  raft::sparse::COO<value_t> knn_coo(handle.get_device_allocator(),
-                                     handle.get_stream());
+  raft::sparse::COO<value_t, value_idx> knn_coo(handle.get_device_allocator(),
+                                                handle.get_stream());
   raft::sparse::linalg::from_knn_symmetrize_matrix<value_idx, value_t>(
     knn_indices, knn_dists, n, n_neighbors, &knn_coo, handle.get_stream(),
     handle.get_device_allocator());
 
-  raft::sparse::COO<value_t> cgraph_coo(handle.get_device_allocator(),
-                                        handle.get_stream());
   raft::sparse::spectral::fit_embedding(
     handle, /*rows=*/knn_coo.rows(), /*cols=*/knn_coo.cols(),
     /*vals=*/knn_coo.vals(),
-    /*nnz=*/knn_coo.nnz, /*n=*/n, n_components, out, seed);
+    /*nnz=*/knn_coo.nnz, /*n=*/(value_idx)n, n_components, out, seed);
 }
 }  // namespace Spectral
 }  // namespace ML
