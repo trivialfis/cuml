@@ -37,6 +37,7 @@ from cuml.common.import_utils import has_scipy
 from cuml.common.mixins import CMajorInputTagMixin
 from cuml.common.input_utils import input_to_cupy_array
 from cuml.common import input_to_cuml_array
+from cuml.common.exceptions import NotFittedError
 from cuml.common.sparse_utils import is_sparse
 from cuml.common.sparse_utils import is_dense
 from cuml.metrics.distance_type cimport DistanceType
@@ -854,10 +855,10 @@ class NearestNeighbors(Base,
             numpy's CSR sparse graph (host)
 
         """
-        if not self.X_m:
-            raise ValueError('This NearestNeighbors instance has not been '
-                             'fitted yet, call "fit" before using this '
-                             'estimator')
+        if not hasattr(self, "X_m"):
+            raise NotFittedError('This NearestNeighbors instance has not been '
+                                 'fitted yet, call "fit" before using this '
+                                 'estimator')
 
         if n_neighbors is None:
             n_neighbors = self.n_neighbors
@@ -886,12 +887,10 @@ class NearestNeighbors(Base,
         n_nonzero = n_samples * n_neighbors
         rowptr = cp.arange(0, n_nonzero + 1, n_neighbors)
 
-        sparse_csr = cupyx.scipy.sparse.csr_matrix((distances,
-                                                    cp.ravel(
-                                                        cp.asarray(indices)),
-                                                    rowptr),
-                                                   shape=(n_samples,
-                                                          n_samples_fit))
+        sparse_csr = cupyx.scipy.sparse.csr_matrix(
+            (distances, cp.ravel(cp.asarray(indices)), rowptr),
+            shape=(n_samples, n_samples_fit)
+        )
 
         return sparse_csr
 

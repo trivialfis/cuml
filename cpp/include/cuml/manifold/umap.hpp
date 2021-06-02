@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include <cinttypes>
 
 #include <raft/sparse/coo.hpp>
 
@@ -199,6 +200,5 @@ void transform_sparse(const raft::handle_t& handle,
                       int embedding_n,
                       UMAPParams* params,
                       float* transformed);
-
 }  // namespace UMAP
 }  // namespace ML

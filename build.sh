@@ -261,6 +261,7 @@ if completeBuild || hasArg libcuml || hasArg prims || hasArg bench || hasArg pri
           -DDISABLE_DEPRECATION_WARNING=${BUILD_DISABLE_DEPRECATION_WARNING} \
           -DCMAKE_PREFIX_PATH=${INSTALL_PREFIX} \
           -DCMAKE_MESSAGE_LOG_LEVEL=${CMAKE_LOG_LEVEL} \
+	  -DCPM_raft_SOURCE=/home/fis/Workspace/raft_dev/raft \
           ${CUML_EXTRA_CMAKE_ARGS} \
           ..
 fi

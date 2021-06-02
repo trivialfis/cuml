@@ -202,6 +202,7 @@ def extract_knn_graph(knn_graph, convert_dtype=True, sparse=False):
         knn_graph.data = knn_graph.data[reordering]
 
     knn_indices = None
+    print("knn_graph:", knn_graph)
     if isinstance(knn_graph, (csr_matrix, cp_csr_matrix)):
         knn_indices = knn_graph.indices
     elif isinstance(knn_graph, (coo_matrix, cp_coo_matrix)):
