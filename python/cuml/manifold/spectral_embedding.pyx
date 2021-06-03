@@ -13,17 +13,17 @@ from libc.stdint cimport uint64_t
 
 cdef extern from "cuml/manifold/spectral.hpp" namespace "ML::Spectral":
 
-    void fit_embedding(
-        handle_t & handle,
-        int * rows,
-        int * cols,
-        float * vals,
-        int nnz,
-        int n,
-        int n_components,
-        float * out,
-        uint64_t seed
-    ) except +
+    # void fit_embedding(
+    #     handle_t & handle,
+    #     int * rows,
+    #     int * cols,
+    #     float * vals,
+    #     int nnz,
+    #     int n,
+    #     int n_components,
+    #     float * out,
+    #     uint64_t seed
+    # ) except +
 
     # pre-computed knn
     void fit_embedding(
@@ -55,11 +55,12 @@ def spectral_embedding(adjacency, *, n_components=8, random_state=None):
 
 class SpectralEmbedding(Base, CMajorInputTagMixin):
     def __init__(
-        self, *,
+        self,
+        *,
         n_components,
         affinity="nearest_neighbors",
         random_state=None,
-        n_neighbors=None
+        n_neighbors=None,
         verbose=False,
         output_type=None,
         handle=None,
@@ -70,7 +71,9 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
         self.affinity = affinity
 
         if self.affinity not in {
-            "nearest_neighbors", "precomputed", "precomputed_nearest_neighbors"
+            "nearest_neighbors",
+            "precomputed",
+            "precomputed_nearest_neighbors",
         }:
             raise ValueError("Unsupported affinity type: %s".format(self.affinity))
 
@@ -89,6 +92,32 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             self.random_state = rs.randint(
                 low=0, high=np.iinfo(np.uint64).max, dtype=np.uint64
             )
+
+    def _fit_precomputed_nn(self, X):
+        n_neighbors = X.data.reshape((self.n_rows, -1)).shape[1]
+        cdef handle_t * handle = <handle_t*> < size_t > self.handle.getHandle()
+        cdef uintptr_t embed_raw = self.embedding_.ptr
+
+        if self.n_rows <= 1:
+            raise ValueError("There needs to be more than 1 sample.")
+
+        (knn_indices_m, knn_indices_ctype), (knn_dists_m, knn_dists_ctype) =\
+            extract_knn_graph(X, True, True)
+
+        cdef uintptr_t knn_indices_raw = knn_indices_ctype or 0
+        cdef uintptr_t knn_dists_raw = knn_dists_ctype or 0
+
+        fit_embedding(
+            handle[0],
+            self.n_rows,
+            <int*> knn_indices_raw,
+            <float*> knn_dists_raw,
+            self.n_components,
+            n_neighbors,
+            <float*> embed_raw,
+            self.random_state
+        )
+
 
     def fit(self, X, y=None):
         assert y is None
@@ -118,24 +147,4 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
         elif self.affinity == "precomputed":
             pass
         elif self.affinity == "precomputed_nearest_neighbors":
-            n_neighbors = X.data.reshape((self.n_rows, -1)).shape[1]
-
-            if self.n_rows <= 1:
-                raise ValueError("There needs to be more than 1 sample.")
-
-            (knn_indices_m, knn_indices_ctype), (knn_dists_m, knn_dists_ctype) =\
-                extract_knn_graph(X, True, True)
-
-            cdef uintptr_t knn_indices_raw = knn_indices_ctype or 0
-            cdef uintptr_t knn_dists_raw = knn_dists_ctype or 0
-
-                     fit_embedding(
-                handle[0],
-                self.n_rows,
-                <int*> knn_indices_raw,
-                <float*> knn_dists_raw,
-                self.n_components,
-                n_neighbors,
-                <float*> embed_raw,
-                self.random_state
-            )
+            self._fit_precomputed_nn(X)
