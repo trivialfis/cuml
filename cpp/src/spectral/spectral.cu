@@ -85,6 +85,7 @@ void fit_embedding(raft::handle_t const &handle, float *X, int n_samples,
   rmm::device_uvector<int> knn_indices(n_samples * n_neighbors,
                                        handle.get_stream());
   thrust::copy_n(rmm::exec_policy(handle.get_stream_view()), knn_coo.knn_dists,
+                 n_samples * n_neighbors,
                  knn_indices.begin());
   fit_embedding(handle, n_samples, knn_indices.data(), knn_coo.knn_dists,
                 n_components, n_neighbors, out, seed);
