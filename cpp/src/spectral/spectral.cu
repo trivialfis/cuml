@@ -17,6 +17,7 @@
 #include <cuml/manifold/spectral.hpp>
 
 #include <raft/sparse/coo.cuh>
+#include <raft/sparse/op/filter.cuh>
 #include <raft/sparse/linalg/symmetrize.cuh>
 #include <raft/sparse/linalg/spectral.cuh>
 #include <raft/spatial/knn/knn.hpp>
@@ -59,13 +60,21 @@ void fit_embedding_with_knn(raft::handle_t const &handle, int n,
   using value_idx = int32_t;
   raft::sparse::COO<value_t, value_idx> knn_coo(handle.get_device_allocator(),
                                                 handle.get_stream());
+
   raft::sparse::linalg::from_knn_symmetrize_matrix<value_idx, value_t>(
     knn_indices, knn_dists, n, n_neighbors, &knn_coo, handle.get_stream(),
     handle.get_device_allocator());
 
+  raft::sparse::COO<value_t, value_idx> out_coo(handle.get_device_allocator(),
+                                                handle.get_stream());
+  raft::sparse::op::coo_remove_zeros<256, value_t>(
+    &knn_coo, &out_coo, handle.get_device_allocator(), handle.get_stream());
+  raft::sparse::op::coo_sort<value_t>(&out_coo, handle.get_device_allocator(),
+                                      handle.get_stream());
+
   raft::sparse::spectral::fit_embedding(
-    handle, /*rows=*/knn_coo.rows(), /*cols=*/knn_coo.cols(),
-    /*vals=*/knn_coo.vals(),
+    handle, /*rows=*/out_coo.rows(), /*cols=*/out_coo.cols(),
+    /*vals=*/out_coo.vals(),
     /*nnz=*/knn_coo.nnz, /*n=*/(value_idx)n, n_components, out, seed);
 }
 
@@ -89,9 +98,14 @@ void fit_embedding(raft::handle_t const &handle, float *X, int n_samples,
                                       n_neighbors);
 
   rmm::device_uvector<int> knn_indices_i32(n_samples * n_neighbors,
-                                           handle.get_stream());
-  thrust::copy_n(rmm::exec_policy(handle.get_stream_view()), knn.knn_dists,
-                 n_samples * n_neighbors, knn_indices.begin());
+                                           handle.get_stream_view());
+  thrust::copy_n(rmm::exec_policy(handle.get_stream_view()), knn.knn_indices,
+                 n_samples * n_neighbors, knn_indices_i32.begin());
+
+  // std::cout << raft::arr2Str(knn_indices_i32.data(), knn_indices_i32.size(),
+  //                            "knn_indices", handle.get_stream())
+  //           << std::endl;
+
   fit_embedding_with_knn(handle, n_samples, knn_indices_i32.data(),
                          knn.knn_dists, n_components, n_neighbors, out, seed);
 }
