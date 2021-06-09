@@ -51,9 +51,10 @@ void fit_embedding(const raft::handle_t &handle, int *rows, int *cols,
                                         n_components, out, seed);
 }
 
-void fit_embedding(raft::handle_t const &handle, int n, int32_t *knn_indices,
-                   float *knn_dists, int n_components, int n_neighbors,
-                   float *out, uint64_t seed) {
+void fit_embedding_with_knn(raft::handle_t const &handle, int n,
+                            int32_t *knn_indices, float *knn_dists,
+                            int n_components, int n_neighbors, float *out,
+                            uint64_t seed) {
   using value_t = float;
   using value_idx = int32_t;
   raft::sparse::COO<value_t, value_idx> knn_coo(handle.get_device_allocator(),
@@ -87,8 +88,9 @@ void fit_embedding(raft::handle_t const &handle, float *X, int n_samples,
   thrust::copy_n(rmm::exec_policy(handle.get_stream_view()), knn_coo.knn_dists,
                  n_samples * n_neighbors,
                  knn_indices.begin());
-  fit_embedding(handle, n_samples, knn_indices.data(), knn_coo.knn_dists,
-                n_components, n_neighbors, out, seed);
+  fit_embedding_with_knn(handle, n_samples, knn_indices.data(),
+                         knn_coo.knn_dists, n_components, n_neighbors, out,
+                         seed);
 }
 }  // namespace Spectral
 }  // namespace ML
