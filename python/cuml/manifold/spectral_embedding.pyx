@@ -60,7 +60,6 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
 
         if self.affinity not in {
             "nearest_neighbors",
-            "precomputed",
             "precomputed_nearest_neighbors",
         }:
             raise ValueError("Unsupported affinity type: %s".format(self.affinity))
