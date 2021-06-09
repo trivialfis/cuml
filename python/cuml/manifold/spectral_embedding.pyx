@@ -135,10 +135,10 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
                 <float*> embed_raw,
                 self.random_state
             )
-        elif self.affinity == "precomputed":
-            pass
         elif self.affinity == "precomputed_nearest_neighbors":
             self._fit_precomputed_nn(X)
+        else:
+            raise ValueError("Unknown affinity.")
 
         return self
 

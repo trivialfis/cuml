@@ -78,12 +78,11 @@ void fit_embedding(raft::handle_t const &handle, float *X, int n_samples,
     n_samples * n_neighbors, handle.get_stream_view());
   rmm::device_uvector<float> knn_dists(n_samples * n_neighbors,
                                        handle.get_stream_view());
-  knn_graph<knn_indices_dense_t, float> knn(n_samples, n_neighbors, knn_indices.data(), knn_dists.data());
+  knn_graph<knn_indices_dense_t, float> knn(
+    n_samples, n_neighbors, knn_indices.data(), knn_dists.data());
 
-  std::vector<float *> ptrs(1);
-  std::vector<int> sizes(1);
-  ptrs[0] = inputs.X;
-  sizes[0] = inputs.n;
+  std::vector<float *> ptrs(1, inputs.X);
+  std::vector<int> sizes(1, inputs.n);
 
   raft::spatial::knn::brute_force_knn(handle, ptrs, sizes, n_features, inputs.X,
                                       inputs.n, knn.knn_indices, knn.knn_dists,
