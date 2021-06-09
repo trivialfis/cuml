@@ -13,20 +13,8 @@ from libc.stdint cimport uint64_t
 
 cdef extern from "cuml/manifold/spectral.hpp" namespace "ML::Spectral":
 
-    # void fit_embedding(
-    #     handle_t & handle,
-    #     int * rows,
-    #     int * cols,
-    #     float * vals,
-    #     int nnz,
-    #     int n,
-    #     int n_components,
-    #     float * out,
-    #     uint64_t seed
-    # ) except +
-
     # pre-computed knn
-    void fit_embedding(
+    void fit_embedding_with_knn(
         handle_t &handle,
         int n,
         int *knn_indices,
@@ -107,7 +95,7 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
         cdef uintptr_t knn_indices_raw = knn_indices_ctype or 0
         cdef uintptr_t knn_dists_raw = knn_dists_ctype or 0
 
-        fit_embedding(
+        fit_embedding_with_knn(
             handle[0],
             self.n_rows,
             <int*> knn_indices_raw,
@@ -134,16 +122,16 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             )
             assert n_rows == X.shape[0]
             assert n_dims == X.shape[1]
-            fit_embedding(
-                handle,
-                X_m,
-                X.shape[0],
-                X.shape[1],
-                self.n_neighbors,
-                self.n_components,
-                <float*> embed_raw,
-                self.random_state
-            )
+            # fit_embedding(
+            #     handle,
+            #     X_m,
+            #     X.shape[0],
+            #     X.shape[1],
+            #     self.n_neighbors,
+            #     self.n_components,
+            #     <float*> embed_raw,
+            #     self.random_state
+            # )
         elif self.affinity == "precomputed":
             pass
         elif self.affinity == "precomputed_nearest_neighbors":
