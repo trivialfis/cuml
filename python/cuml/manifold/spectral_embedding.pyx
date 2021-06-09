@@ -122,16 +122,16 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             )
             assert n_rows == X.shape[0]
             assert n_dims == X.shape[1]
-            # fit_embedding(
-            #     handle,
-            #     X_m,
-            #     X.shape[0],
-            #     X.shape[1],
-            #     self.n_neighbors,
-            #     self.n_components,
-            #     <float*> embed_raw,
-            #     self.random_state
-            # )
+            fit_embedding(
+                handle[0],
+                <float*> <uintptr_t> X_m.ptr,
+                X.shape[0],
+                X.shape[1],
+                self.n_neighbors,
+                self.n_components,
+                <float*> embed_raw,
+                self.random_state
+            )
         elif self.affinity == "precomputed":
             pass
         elif self.affinity == "precomputed_nearest_neighbors":
