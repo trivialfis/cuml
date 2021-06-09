@@ -42,10 +42,11 @@ def spectral_embedding(adjacency, *, n_components=8, random_state=None):
 
 
 class SpectralEmbedding(Base, CMajorInputTagMixin):
+    """Spectral embedding for non-linear dimensionality reduction."""
     def __init__(
         self,
         *,
-        n_components,
+        n_components=2,
         affinity="nearest_neighbors",
         random_state=None,
         n_neighbors=None,
