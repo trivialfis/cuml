@@ -72,25 +72,29 @@ void fit_embedding_with_knn(raft::handle_t const &handle, int n,
 void fit_embedding(raft::handle_t const &handle, float *X, int n_samples,
                    int n_features, int n_neighbors, int n_components,
                    float *out, uint64_t seed) {
-  knn_graph<knn_indices_dense_t, float> knn_coo(n_samples, n_neighbors);
   manifold_dense_inputs_t<float> inputs(X, nullptr, n_samples, n_features);
+
+  rmm::device_uvector<knn_indices_dense_t> knn_indices(
+    n_samples * n_neighbors, handle.get_stream_view());
+  rmm::device_uvector<float> knn_dists(n_samples * n_neighbors,
+                                       handle.get_stream_view());
+  knn_graph<knn_indices_dense_t, float> knn(n_samples, n_neighbors, knn_indices.data(), knn_dists.data());
+
   std::vector<float *> ptrs(1);
   std::vector<int> sizes(1);
   ptrs[0] = inputs.X;
   sizes[0] = inputs.n;
 
   raft::spatial::knn::brute_force_knn(handle, ptrs, sizes, n_features, inputs.X,
-                                      inputs.n, knn_coo.knn_indices,
-                                      knn_coo.knn_dists, n_neighbors);
+                                      inputs.n, knn.knn_indices, knn.knn_dists,
+                                      n_neighbors);
 
-  rmm::device_uvector<int> knn_indices(n_samples * n_neighbors,
-                                       handle.get_stream());
-  thrust::copy_n(rmm::exec_policy(handle.get_stream_view()), knn_coo.knn_dists,
-                 n_samples * n_neighbors,
-                 knn_indices.begin());
-  fit_embedding_with_knn(handle, n_samples, knn_indices.data(),
-                         knn_coo.knn_dists, n_components, n_neighbors, out,
-                         seed);
+  rmm::device_uvector<int> knn_indices_i32(n_samples * n_neighbors,
+                                           handle.get_stream());
+  thrust::copy_n(rmm::exec_policy(handle.get_stream_view()), knn.knn_dists,
+                 n_samples * n_neighbors, knn_indices.begin());
+  fit_embedding_with_knn(handle, n_samples, knn_indices_i32.data(),
+                         knn.knn_dists, n_components, n_neighbors, out, seed);
 }
 }  // namespace Spectral
 }  // namespace ML

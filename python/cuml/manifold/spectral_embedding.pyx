@@ -1,5 +1,6 @@
 import numpy as np
 
+import cuml.internals
 from cuml.common.sparsefuncs import extract_knn_graph
 from cuml.common.base import Base
 from cuml.common.mixins import CMajorInputTagMixin
@@ -107,7 +108,7 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
         )
 
 
-    def fit(self, X, y=None):
+    def fit(self, X, y=None, convert_dtype=True) -> "SpectralEmbedding":
         assert y is None
         cdef handle_t * handle = <handle_t*> < size_t > self.handle.getHandle()
         self.n_rows = X.shape[0]
@@ -117,8 +118,10 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
         cdef uintptr_t embed_raw = self.embedding_.ptr
 
         if self.affinity == "nearest_neighbors":
-            X_m, n_rows, n_dims = input_to_cuml_array(
-                X, order='C', check_dtype=np.float32, convert_to_dtype=True
+            X_m, n_rows, n_dims, dtype = input_to_cuml_array(
+                X, order='C', check_dtype=np.float32, convert_to_dtype=(
+                    np.float32 if convert_dtype else None
+                )
             )
             assert n_rows == X.shape[0]
             assert n_dims == X.shape[1]
@@ -136,3 +139,10 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             pass
         elif self.affinity == "precomputed_nearest_neighbors":
             self._fit_precomputed_nn(X)
+
+        return self
+
+    @cuml.internals.api_base_fit_transform()
+    def fit_transform(self, X, y=None, convert_dtype=True):
+        self.fit(X, y, convert_dtype)
+        return self.embedding_
