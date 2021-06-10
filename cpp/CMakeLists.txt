@@ -302,6 +302,9 @@ if(BUILD_CUML_CPP_LIBRARY)
                CUDA_STANDARD                       17
                CUDA_STANDARD_REQUIRED              ON
                INTERFACE_POSITION_INDEPENDENT_CODE ON
+               CXX_VISIBILITY_PRESET               hidden
+               CUDA_VISIBILITY_PRESET              hidden
+               C_VISIBILITY_PRESET                 hidden
   )
 
   target_compile_definitions(${CUML_CPP_TARGET}
