@@ -24,6 +24,7 @@
 #include <raft/linalg/add.cuh>
 
 #include <raft/linalg/transpose.h>
+#include <raft/sparse/linalg/spectral.cuh>
 #include <raft/random/rng.cuh>
 
 #include <cuml/cluster/spectral.hpp>
@@ -53,9 +54,9 @@ void launcher(const raft::handle_t &handle, int n, int d,
 
   uint64_t seed = params->random_state;
 
-  Spectral::fit_embedding(handle, coo->rows(), coo->cols(), coo->vals(),
-                          coo->nnz, n, params->n_components, tmp_storage.data(),
-                          seed);
+  raft::sparse::spectral::fit_embedding(
+    handle, coo->rows(), coo->cols(), coo->vals(), coo->nnz, n,
+    params->n_components, tmp_storage.data(), seed);
 
   raft::linalg::transpose(handle, tmp_storage.data(), embedding, n,
                           params->n_components, stream);

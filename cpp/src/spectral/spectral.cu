@@ -75,7 +75,7 @@ void fit_embedding_with_knn(raft::handle_t const &handle, int n,
   raft::sparse::spectral::fit_embedding(
     handle, /*rows=*/out_coo.rows(), /*cols=*/out_coo.cols(),
     /*vals=*/out_coo.vals(),
-    /*nnz=*/knn_coo.nnz, /*n=*/(value_idx)n, n_components, out, seed);
+    /*nnz=*/out_coo.nnz, /*n=*/(value_idx)n, n_components, out, seed);
 }
 
 void fit_embedding(raft::handle_t const &handle, float *X, int n_samples,
