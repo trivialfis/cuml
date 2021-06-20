@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cuComplex.h>
+#include <raft/cuda_utils.cuh>
 
 namespace ML {
 namespace TSNE {

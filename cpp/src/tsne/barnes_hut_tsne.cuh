@@ -18,6 +18,7 @@
 #include <raft/cudart_utils.h>
 #include <cuml/common/device_buffer.hpp>
 #include <cuml/common/logger.hpp>
+#include <cuml/manifold/tsne.h>
 #include "barnes_hut_kernels.cuh"
 #include "utils.cuh"
 

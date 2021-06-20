@@ -27,10 +27,12 @@
 #include <linalg/init.h>
 #include <cmath>
 #include <common/device_utils.cuh>
+#include <cuml/manifold/tsne.h>
 #include <raft/linalg/eltwise.cuh>
 #include <raft/mr/device/buffer.hpp>
 #include <raft/stats/sum.cuh>
-#include <rmm/device_vector.hpp>
+#include <rmm/device_uvector.hpp>
+#include <rmm/exec_policy.hpp>
 #include "fft_kernels.cuh"
 #include "utils.cuh"
 
