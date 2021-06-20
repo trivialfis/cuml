@@ -32,6 +32,7 @@
 #include <thrust/system/cuda/execution_policy.h>
 
 #include <common/fast_int_div.cuh>
+#include <common/truncate_float.cuh>
 #include <cstdlib>
 
 #include <raft/cudart_utils.h>
@@ -136,35 +137,7 @@ void apply_embedding_updates(T *head_embedding, T *head_buffer, int head_n,
   }
 }
 
-/**
- * \brief Constructs a rounding factor used to truncate elements in a sum such that the
- * sum of the truncated elements is the same no matter what the order of the sum is.
- *
- * Algorithm 5: Reproducible Sequential Sum in 'Fast Reproducible Floating-Point
- * Summation' by Demmel and Nguyen
- *
- * In algorithm 5 the bound is calculated as $max(|v_i|) * n$.  We use maximum number of
- * edges connected to each vertex as n.
- *
- * The calculation trick is borrowed from fbcuda, which is BSD-licensed.
- */
-template <typename T>
-T create_rounding_factor(T max_abs, int n) {
-  T delta =
-    max_abs / (static_cast<T>(1.0) -
-               static_cast<T>(2.0) * n * std::numeric_limits<T>::epsilon());
-
-  // Calculate ceil(log_2(delta)).
-  // frexpf() calculates exp and returns `x` such that
-  // delta = x * 2^exp, where `x` in (-1.0, -0.5] U [0.5, 1).
-  // Because |x| < 1, exp is exactly ceil(log_2(delta)).
-  int exp;
-  std::frexp(delta, &exp);
-
-  // return M = 2 ^ ceil(log_2(delta))
-  return std::ldexp(static_cast<T>(1.0), exp);
-}
-
+// We use maximum number of edges connected to each vertex as n.
 template <typename T>
 T create_gradient_rounding_factor(const int *head, int nnz, int n_samples,
                                   T alpha, rmm::cuda_stream_view stream) {
@@ -177,7 +150,7 @@ T create_gradient_rounding_factor(const int *head, int nnz, int n_samples,
   uint32_t n_edges =
     *(thrust::max_element(rmm::exec_policy(stream), ptr, ptr + buffer.size()));
   T max_abs = T(n_edges) * T(4.0) * std::abs(alpha);
-  return create_rounding_factor(max_abs, n_edges);
+  return MLCommon::create_rounding_factor(max_abs, n_edges);
 }
 
 /**
