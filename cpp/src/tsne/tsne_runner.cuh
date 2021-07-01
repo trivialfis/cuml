@@ -65,10 +65,15 @@ class TSNE_runner {
       CUML_LOG_WARN(
         "Perplexity should be within ranges (5, 50). Your results might be a"
         " bit strange...");
-    if (params.n_neighbors < params.perplexity * 3.0f)
+    if (params.n_neighbors < params.perplexity * 3.0f) {
+      std::string msg = "# of Nearest Neighbors should be at least 3 * perplexity. ";
+      msg += "perplexity:" + std::to_string(params.perplexity) +
+             ", n_neighbors:" + std::to_string(params_.n_neighbors) +
+             "Your results  might be a bit strange...";
       CUML_LOG_WARN(
         "# of Nearest Neighbors should be at least 3 * perplexity. Your results"
         " might be a bit strange...");
+    }
   }
 
   void run() {
