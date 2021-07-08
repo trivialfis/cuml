@@ -116,6 +116,10 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             (self.n_rows, self.n_components), order="C", dtype=np.float32
         )
         cdef uintptr_t embed_raw = self.embedding_.ptr
+        if self.n_neighbors is None:
+            n_neighbors = 15
+        else:
+            n_neighbors = self.n_neighbors
 
         if self.affinity == "nearest_neighbors":
             X_m, n_rows, n_dims, dtype = input_to_cuml_array(
@@ -130,7 +134,7 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
                 <float*> <uintptr_t> X_m.ptr,
                 X.shape[0],
                 X.shape[1],
-                self.n_neighbors,
+                n_neighbors,
                 self.n_components,
                 <float*> embed_raw,
                 self.random_state
