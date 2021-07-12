@@ -7,6 +7,7 @@ from cuml.common.mixins import CMajorInputTagMixin
 from cuml.common.input_utils import input_to_cuml_array
 from cuml.common.array import CumlArray
 from cuml.raft.common.handle cimport handle_t
+from cuml.neighbors import NearestNeighbors
 
 from libc.stdint cimport uintptr_t
 from libc.stdint cimport uint64_t
@@ -122,23 +123,10 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             n_neighbors = self.n_neighbors
 
         if self.affinity == "nearest_neighbors":
-            X_m, n_rows, n_dims, dtype = input_to_cuml_array(
-                X, order='C', check_dtype=np.float32, convert_to_dtype=(
-                    np.float32 if convert_dtype else None
-                )
-            )
-            assert n_rows == X.shape[0]
-            assert n_dims == X.shape[1]
-            fit_embedding(
-                handle[0],
-                <float*> <uintptr_t> X_m.ptr,
-                X.shape[0],
-                X.shape[1],
-                n_neighbors,
-                self.n_components,
-                <float*> embed_raw,
-                self.random_state
-            )
+            neigh = NearestNeighbors(n_neighbors=self.n_neighbors)
+            neigh.fit(X, convert_dtype=convert_dtype)
+            knn_graph = neigh.kneighbors_graph(X, mode="distance")
+            self._fit_precomputed_nn(knn_graph)
         elif self.affinity == "precomputed_nearest_neighbors":
             self._fit_precomputed_nn(X)
         else:

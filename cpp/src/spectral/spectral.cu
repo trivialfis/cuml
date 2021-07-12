@@ -17,6 +17,7 @@
 #include <cuml/manifold/spectral.hpp>
 
 #include <raft/sparse/coo.cuh>
+#include <raft/sparse/csr.cuh>
 #include <raft/sparse/op/filter.cuh>
 #include <raft/sparse/linalg/symmetrize.cuh>
 #include <raft/sparse/linalg/spectral.cuh>
@@ -61,6 +62,7 @@ void fit_embedding_with_knn(raft::handle_t const &handle, int n,
   raft::sparse::COO<value_t, value_idx> knn_coo(handle.get_device_allocator(),
                                                 handle.get_stream());
 
+  // fixme: is this necessary?
   raft::sparse::linalg::from_knn_symmetrize_matrix<value_idx, value_t>(
     knn_indices, knn_dists, n, n_neighbors, &knn_coo, handle.get_stream(),
     handle.get_device_allocator());
@@ -77,6 +79,12 @@ void fit_embedding_with_knn(raft::handle_t const &handle, int n,
     /*vals=*/out_coo.vals(),
     /*nnz=*/out_coo.nnz, /*n=*/(value_idx)n, n_components, out, seed);
 }
+
+struct CSR {
+  rmm::device_uvector<float> values;
+  rmm::device_uvector<int32_t> indices;
+  rmm::device_uvector<size_t> indptr;
+};
 
 void fit_embedding(raft::handle_t const &handle, float *X, int n_samples,
                    int n_features, int n_neighbors, int n_components,
@@ -96,6 +104,17 @@ void fit_embedding(raft::handle_t const &handle, float *X, int n_samples,
   raft::spatial::knn::brute_force_knn(handle, ptrs, sizes, n_features, inputs.X,
                                       inputs.n, knn.knn_indices, knn.knn_dists,
                                       n_neighbors);
+
+  std::string indices_str = raft::arr2Str(
+    knn_indices.data(), knn_indices.size(), "knn_indices", handle.get_stream());
+  std::string values_str = raft::arr2Str(knn_dists.data(), knn_dists.size(),
+                                         "knn_distances", handle.get_stream());
+  // std::cout << "values:" << values_str << std::endl
+  //           << "indices:" << indices_str << std::endl;
+
+  std::pair<int32_t, int32_t> shape;
+  shape.first = n_samples;
+  shape.second = n_samples;
 
   rmm::device_uvector<int> knn_indices_i32(n_samples * n_neighbors,
                                            handle.get_stream_view());

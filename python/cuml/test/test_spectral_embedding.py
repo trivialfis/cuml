@@ -1,5 +1,6 @@
 from sklearn import datasets
 from sklearn.neighbors import NearestNeighbors
+from cuml.neighbors import NearestNeighbors
 from cuml.manifold import SpectralEmbedding
 import numpy as np
 
