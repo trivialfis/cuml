@@ -99,13 +99,8 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             # connectivity = estimator.kneighbors_graph(X=X, mode='connectivity')
             # self.affinity_matrix_ = cupy.sparse.csr_matrix(0.5 * (connectivity + connectivity.T))
         elif self.affinity == "nearest_neighbors":
-            self.n_neighbors_ = (self.n_neighbors if self.n_neighbors is not None else max(int(X.shape[0] / 10), 1))
-            self.affinity_matrix_ = kneighbors_graph(
-                X, self.n_neighbors_, include_self=True, handle=self.handle
-            )
-            self.affinity_matrix_ = cupy.sparse.csr_matrix(
-                0.5 * (self.affinity_matrix_ + self.affinity_matrix_.T)
-            )
+            connectivity = X
+            self.affinity_matrix_ = cupy.sparse.csr_matrix(0.5 * (connectivity + connectivity.T))
         else:
             assert self.affinity == "rbf"
             X = cupy.asarray(X, dtype=cupy.float32)
@@ -189,13 +184,18 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             n_neighbors = self.n_neighbors
 
         if self.affinity == "nearest_neighbors":
-            knn_graph = kneighbors_graph(
-                X, mode="connectivity",
-                include_self=True,
-                n_neighbors=self.n_neighbors,
-                handle=self.handle,
-            ).to_output(output_type="cupy", output_format="coo")
-            self._fit_precomputed_nn(knn_graph)
+            self.n_neighbors_ = (
+                self.n_neighbors if self.n_neighbors is not None else max(int(X.shape[0] / 10), 1)
+            )
+            neigh = NearestNeighbors(
+                n_neighbors=self.n_neighbors_, handle=self.handle, output_type="cupy"
+            )
+            neigh.fit(X)
+            knn_graph = neigh.kneighbors_graph(
+                X, n_neighbors=self.n_neighbors_, mode="connectivity"
+            ).to_output(output_format="coo").tocsr()
+            affinity = self._get_affinity_matrix(knn_graph)
+            self._fit_precomputed_nn(affinity)
         elif self.affinity == "precomputed_nearest_neighbors":
             affinity = self._get_affinity_matrix(X)
             import cupy
