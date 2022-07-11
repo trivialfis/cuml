@@ -81,11 +81,6 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             ).fit(X)
             connectivity = estimator.kneighbors_graph(X=X, mode='connectivity')
             self.affinity_matrix_ = cupy.sparse.csr_matrix(0.5 * (connectivity + connectivity.T))
-            # estimator = NearestNeighbors(
-            #     n_neighbors=self.n_neighbors, metric="precomputed", output_type="cupy"
-            # ).fit(X)
-            # connectivity = estimator.kneighbors_graph(X=X, mode='connectivity')
-            # self.affinity_matrix_ = cupy.sparse.csr_matrix(0.5 * (connectivity + connectivity.T))
         elif self.affinity == "nearest_neighbors":
             connectivity = X
             self.affinity_matrix_ = cupy.sparse.csr_matrix(0.5 * (connectivity + connectivity.T))
@@ -106,9 +101,6 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
 
         if self.n_rows <= 1:
             raise ValueError("There needs to be more than 1 sample.")
-
-        # (knn_indices_m, knn_indices_ctype), (knn_dists_m, knn_dists_ctype) =\
-        #     extract_knn_graph(X, True, True)
 
         X = X.tocoo()
         rows_m, _, _, _ = \
