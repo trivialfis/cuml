@@ -20,18 +20,6 @@ from libc.stdint cimport uint64_t
 
 
 cdef extern from "cuml/manifold/spectral.hpp" namespace "ML::Spectral":
-
-    # pre-computed knn
-    void fit_embedding_with_knn(
-        handle_t &handle,
-        int n,
-        int *knn_indices,
-        float *knn_dists,
-        int n_components,
-        int n_neighbors,
-        float *out, uint64_t seed
-    ) except +
-
     void fit_embedding(handle_t &handle, int *rows, int *cols,
                        float *vals, int nnz, int n, int n_components, float *out,
                        uint64_t seed) except +

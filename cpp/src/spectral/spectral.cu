@@ -644,7 +644,7 @@ void fit_embedding(const raft::handle_t& handle,
 
   auto it = thrust::make_counting_iterator(0ul);
   thrust::for_each_n(policy, it, n_components * n, [=] HD(size_t i) {
-    auto coord = unravel_index(i, drop_first.extents(), raft::detail::stdex::layout_right{});
+    auto coord = raft::unravel_index(i, drop_first.extents(), raft::detail::stdex::layout_right{});
     std::apply(tran_v, coord) = std::apply(drop_first, coord);
   });
 
