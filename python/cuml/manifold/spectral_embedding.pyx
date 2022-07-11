@@ -154,24 +154,10 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             seed,
         )
 
-        # cdef uintptr_t knn_indices_raw = knn_indices_ctype or 0
-        # cdef uintptr_t knn_dists_raw = knn_dists_ctype or 0
-
-        # print("n_neighbors:", n_neighbors)
-        # fit_embedding_with_knn(
-        #     handle[0],
-        #     self.n_rows,
-        #     <int*> knn_indices_raw,
-        #     <float*> knn_dists_raw,
-        #     self.n_components,
-        #     n_neighbors,
-        #     <float*> embed_raw,
-        #     self.random_state
-        # )
-
 
     def fit(self, X, y=None, convert_dtype=True) -> "SpectralEmbedding":
-        assert y is None
+        if y is not None:
+            raise ValueError("y is not used for `SpectralEmbedding`.")
         cdef handle_t * handle = <handle_t*> < size_t > self.handle.getHandle()
         self.n_rows = X.shape[0]
         self.embedding_ = CumlArray.zeros(
