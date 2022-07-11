@@ -12,7 +12,6 @@ from cuml.common.mixins import CMajorInputTagMixin
 from cuml.common.input_utils import input_to_cuml_array
 from cuml.common.array import CumlArray
 from cuml.common.array_sparse import SparseCumlArray
-from cuml.metrics.pairwise_kernels import rbf_kernel
 from cuml.neighbors import NearestNeighbors, kneighbors_graph
 
 from libc.stdint cimport uintptr_t
@@ -63,7 +62,6 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             "nearest_neighbors",
             "precomputed_nearest_neighbors",
             "precomputed",
-            "rbf",
         }:
             raise ValueError("Unsupported affinity type: %s".format(self.affinity))
 
@@ -85,10 +83,7 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             connectivity = X
             self.affinity_matrix_ = cupy.sparse.csr_matrix(0.5 * (connectivity + connectivity.T))
         else:
-            assert self.affinity == "rbf"
-            X = cupy.asarray(X, dtype=cupy.float32)
-            self.gamma_ = (self.gamma if self.gamma is not None else 1.0 / X.shape[1])
-            self.affinity_matrix_ = rbf_kernel(X, X, gamma=self.gamma)
+            raise ValueError("Unknown affinity.")
         return self.affinity_matrix_
 
     def _fit_precomputed_nn(self, X):
@@ -163,11 +158,6 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             affinity = self._get_affinity_matrix(knn_graph)
             self._fit_precomputed_nn(affinity)
         elif self.affinity == "precomputed_nearest_neighbors":
-            affinity = self._get_affinity_matrix(X)
-            import cupy
-            affinity = cupy.sparse.coo_matrix(affinity)
-            self._fit_precomputed_nn(affinity)
-        elif self.affinity == "rbf":
             affinity = self._get_affinity_matrix(X)
             import cupy
             affinity = cupy.sparse.coo_matrix(affinity)
