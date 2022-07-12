@@ -103,8 +103,7 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
                                 check_dtype=(np.float32, np.float64),
                                 convert_to_dtype=np.float32)
 
-        rs = get_rs(self.random_state)
-        seed = rs.randint(low=0, high=np.iinfo(np.uint64).max, dtype=np.uint64)
+        seed = get_rs(self.random_state)
         fit_embedding(
             handle[0],
             <int*><uintptr_t> rows_m.ptr,
