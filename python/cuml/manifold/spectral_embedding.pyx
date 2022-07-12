@@ -1,21 +1,17 @@
+import cupy
 import numpy as np
 
-from sklearn.utils import check_random_state
-
-import cupy
 from raft.common.handle cimport handle_t
 
 import cuml.internals
-from cuml.common.sparsefuncs import extract_knn_graph
-from cuml.common.base import Base
-from cuml.common.mixins import CMajorInputTagMixin
-from cuml.common.input_utils import input_to_cuml_array
 from cuml.common.array import CumlArray
 from cuml.common.array_sparse import SparseCumlArray
+from cuml.common.base import Base
+from cuml.common.input_utils import input_to_cuml_array
+from cuml.common.mixins import CMajorInputTagMixin
 from cuml.neighbors import NearestNeighbors, kneighbors_graph
 
-from libc.stdint cimport uintptr_t
-from libc.stdint cimport uint64_t
+from libc.stdint cimport uint64_t, uintptr_t
 
 
 cdef extern from "cuml/manifold/spectral.hpp" namespace "ML::Spectral":
@@ -48,7 +44,6 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
         affinity="nearest_neighbors",
         random_state=None,
         n_neighbors=None,
-        gamma=None,
         verbose=False,
         output_type=None,
         handle=None,
@@ -57,6 +52,8 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
 
         self.n_components = n_components
         self.affinity = affinity
+        self.n_neighbors = n_neighbors
+        self.random_state = random_state
 
         if self.affinity not in {
             "nearest_neighbors",
@@ -64,9 +61,8 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
         }:
             raise ValueError("Unsupported affinity type: %s".format(self.affinity))
 
-        self.n_neighbors = n_neighbors
-        self.gamma = gamma
-        self.random_state = random_state
+    def _more_tags(self):
+        return {'pairwise': self.affinity in ["precomputed"]}
 
     def _get_affinity_matrix(self, X):
         if self.affinity == "precomputed":
@@ -107,7 +103,7 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
                                 check_dtype=(np.float32, np.float64),
                                 convert_to_dtype=np.float32)
 
-        rs = check_random_state(self.random_state)
+        rs = get_rs(self.random_state)
         seed = rs.randint(low=0, high=np.iinfo(np.uint64).max, dtype=np.uint64)
         fit_embedding(
             handle[0],
@@ -120,7 +116,6 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             <float*> embed_raw,
             seed,
         )
-
 
     def fit(self, X, y=None, convert_dtype=True) -> "SpectralEmbedding":
         if y is not None:
