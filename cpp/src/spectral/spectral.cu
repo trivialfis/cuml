@@ -31,15 +31,19 @@
 
 namespace ML {
 namespace Spectral {
-template <typename index_type, typename value_type, typename ThrustExecPolicy>
-auto Diagonal(index_type const* rows,
+
+/**
+ * \brief Get diagonal values from a COO matrix
+ */
+template <typename index_type, typename value_type>
+auto Diagonal(raft::handle_t const& handle,
+              index_type const* rows,
               index_type const* cols,
               value_type const* values,
               size_t nnz,
-              size_t n,
-              raft::handle_t const& handle,
-              ThrustExecPolicy policy) -> rmm::device_uvector<value_type>
+              size_t n) -> rmm::device_uvector<value_type>
 {
+  auto policy  = handle.get_thrust_policy();
   auto it      = thrust::make_zip_iterator(rows, cols, values);
   using Triple = thrust::tuple<index_type, index_type, value_type>;
   rmm::device_uvector<value_type> results(n, handle.get_stream());
@@ -158,8 +162,7 @@ struct laplacian_matrix_t : public raft::sparse::COO<value_type, index_type> {
                      index_type const* _cols,
                      value_type const* _vals,
                      size_t n_rows,
-                     size_t nnz,
-                     rmm::device_uvector<value_type> const& diag)
+                     size_t nnz)
     : raft::sparse::COO<value_type, index_type>{handle.get_stream(),
                                                 index_type(nnz),
                                                 index_type(n_rows),
@@ -175,10 +178,11 @@ struct laplacian_matrix_t : public raft::sparse::COO<value_type, index_type> {
     thrust::copy(policy, _vals, _vals + nnz, this->vals());
 
     thrust::fill(policy, ones.begin(), ones.end(), 1.0f);
+    diagonal_ = ::ML::Spectral::Diagonal(handle, _rows, _cols, _vals, nnz, n_rows);
     // calcuate the degree matrix
     this->SpMV(1, ones.data(), 0, diagonal_.data());
     // normalize it.
-    this->Normalize(policy, handle, diag);
+    this->Normalize(policy, handle, diagonal_);
 
     ASSERT(this->rows_arr.size() == this->cols_arr.size(), "Check");
     ASSERT(this->rows_arr.size() == this->vals_arr.size(), "Check");
@@ -270,7 +274,12 @@ struct laplacian_matrix_t : public raft::sparse::COO<value_type, index_type> {
   }
 
   size_t NNZ() const { return this->vals_arr.size(); }
+  auto Diagonal() const
+  {
+    return raft::make_device_vector_view(diagonal_.data(), diagonal_.size());
+  }
 
+ private:
   raft::handle_t const& handle_;
   rmm::device_uvector<value_type> diagonal_;
 };
@@ -291,10 +300,8 @@ void Partition(raft::handle_t const& handle,
   auto stream   = handle.get_stream();
   auto policy   = handle.get_thrust_policy();
 
-  auto diagonal = Diagonal(rows, cols, vals, nnz, n_samples, handle, policy);
-
   laplacian_matrix_t<vertex_t, weight_t> laplacian{
-    handle, policy, rows, cols, vals, n_samples, nnz, diagonal};
+    handle, policy, rows, cols, vals, n_samples, nnz};
   thrust::transform(policy,
                     laplacian.vals(),
                     laplacian.vals() + laplacian.NNZ(),
@@ -323,9 +330,9 @@ void Partition(raft::handle_t const& handle,
                              permutation.data(),
                              permutation.size() * sizeof(float),
                              cudaMemcpyDefault,
-                             handle.get_stream()));
+                             stream));
 
-  auto d_diagonal = laplacian.diagonal_.data();
+  auto d_diagonal = laplacian.Diagonal();
   it              = thrust::make_counting_iterator(0ul);
   thrust::for_each(policy, it, it + n_samples * n_components, [=] HD(size_t i) {
     size_t cidx = i % n_samples;
@@ -389,13 +396,10 @@ void fit_embedding(const raft::handle_t& handle,
   ASSERT(out, "Invalid pointer for embedding output.");
 
   auto stream   = handle.get_stream();
-  auto policy   = rmm::exec_policy(handle.get_stream());
-  auto diagonal = Diagonal(rows, cols, vals, nnz, n, handle, policy);
+  auto policy   = handle.get_thrust_policy();
 
-  using index_type = int32_t;
+  using index_type = std::int32_t;
   using value_type = float;
-
-  handle.get_stream().synchronize();
 
   index_type neigvs       = n_components + 1;
   index_type maxiter      = 5000;  // default reset value (when set to 0);
@@ -407,8 +411,8 @@ void fit_embedding(const raft::handle_t& handle,
   cfg.reorthogonalize = true;
   raft::spectral::lanczos_solver_t<index_type, value_type> eig_solver{cfg};
 
-  rmm::device_uvector<value_type> eigen_values(neigvs, handle.get_stream());
-  rmm::device_uvector<value_type> eigen_vectors(neigvs * n, handle.get_stream());
+  rmm::device_uvector<value_type> eigen_values(neigvs, stream);
+  rmm::device_uvector<value_type> eigen_vectors(neigvs * n, stream);
 
   Partition<index_type, value_type>(handle,
                                     rows,
@@ -426,7 +430,7 @@ void fit_embedding(const raft::handle_t& handle,
     map_v, std::make_tuple(1, neigvs), raft::detail::stdex::full_extent);
   ASSERT(drop_first.size() == static_cast<size_t>(n_components * n), "Invalid shape of eigen map.");
 
-  auto tran   = raft::make_device_matrix<float>(n_components, n, handle.get_stream());
+  auto tran   = raft::make_device_matrix<float>(n_components, n, stream);
   auto tran_v = tran.view();
 
   auto it = thrust::make_counting_iterator(0ul);
