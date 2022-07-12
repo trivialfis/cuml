@@ -60,7 +60,6 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
 
         if self.affinity not in {
             "nearest_neighbors",
-            "precomputed_nearest_neighbors",
             "precomputed",
         }:
             raise ValueError("Unsupported affinity type: %s".format(self.affinity))
@@ -71,14 +70,7 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
 
     def _get_affinity_matrix(self, X):
         if self.affinity == "precomputed":
-            self.affinity_matrix_ = X
-        elif self.affinity == "precomputed_nearest_neighbors":
-            from sklearn.neighbors import NearestNeighbors as sckl_nn
-            estimator = sckl_nn(
-                n_neighbors=self.n_neighbors, metric="precomputed",
-            ).fit(X)
-            connectivity = estimator.kneighbors_graph(X=X, mode='connectivity')
-            self.affinity_matrix_ = cupy.sparse.csr_matrix(0.5 * (connectivity + connectivity.T))
+            self.affinity_matrix_ = cupy.sparse.csr_matrix(X, copy=False)
         elif self.affinity == "nearest_neighbors":
             connectivity = X
             self.affinity_matrix_ = cupy.sparse.csr_matrix(0.5 * (connectivity + connectivity.T))
@@ -86,7 +78,7 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
             raise ValueError("Unknown affinity.")
         return self.affinity_matrix_
 
-    def _fit_precomputed_nn(self, X):
+    def _fit_precomputed(self, X):
         if isinstance(X, SparseCumlArray):
             n_neighbors = X.data.shape[0] // self.n_rows
         else:
@@ -156,12 +148,10 @@ class SpectralEmbedding(Base, CMajorInputTagMixin):
                 X, n_neighbors=self.n_neighbors_, mode="connectivity"
             ).to_output(output_format="coo").tocsr()
             affinity = self._get_affinity_matrix(knn_graph)
-            self._fit_precomputed_nn(affinity)
-        elif self.affinity == "precomputed_nearest_neighbors":
+            self._fit_precomputed(affinity)
+        elif self.affinity == "precomputed":
             affinity = self._get_affinity_matrix(X)
-            import cupy
-            affinity = cupy.sparse.coo_matrix(affinity)
-            self._fit_precomputed_nn(affinity)
+            self._fit_precomputed(affinity)
         else:
             raise ValueError("Unknown affinity.")
 
