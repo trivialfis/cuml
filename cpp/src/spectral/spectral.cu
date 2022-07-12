@@ -70,7 +70,6 @@ cusparseStatus_t cuSparseCreateCOO(cusparseSpMatDescr_t* desc,
                                    int32_t* cols,
                                    float* vals)
 {
-  std::cout << "r:" << n_rows << ", c:" << n_cols << ", nnz" << nnz << std::endl;
   return cusparseCreateCoo(desc,
                            n_rows,
                            n_cols,
@@ -148,26 +147,6 @@ struct coo_view_t {
                                       out->cols.data(),
                                       out->vals.data());
   }
-
-  std::string toStr(raft::handle_t const& handle, std::string name) const
-  {
-    std::vector<index_t> h_rows(nnz);
-    std::vector<index_t> h_cols(nnz);
-    std::vector<value_t> h_vals(nnz);
-    CUDA_CHECK(cudaMemcpyAsync(
-      h_rows.data(), rows, nnz * sizeof(index_t), cudaMemcpyDeviceToHost, handle.get_stream()));
-    CUDA_CHECK(cudaMemcpyAsync(
-      h_cols.data(), cols, nnz * sizeof(index_t), cudaMemcpyDeviceToHost, handle.get_stream()));
-    CUDA_CHECK(cudaMemcpyAsync(
-      h_vals.data(), vals, nnz * sizeof(value_t), cudaMemcpyDeviceToHost, handle.get_stream()));
-
-    std::stringstream ss;
-    ss << name << ":\n";
-    for (size_t i = 0; i < h_rows.size(); ++i) {
-      ss << "(" << h_rows[i] << ", " << h_cols[i] << ")\t" << h_vals[i] << "\n";
-    }
-    return ss.str();
-  }
 };
 
 template <typename index_type, typename value_type>
@@ -196,7 +175,6 @@ struct laplacian_matrix_t : public raft::sparse::COO<value_type, index_type> {
     thrust::copy(policy, _vals, _vals + nnz, this->vals());
 
     thrust::fill(policy, ones.begin(), ones.end(), 1.0f);
-    std::cout << "o.size(): " << ones.size() << ", d.size():" << diagonal_.size() << std::endl;
     // calcuate the degree matrix
     this->SpMV(1, ones.data(), 0, diagonal_.data());
     // normalize it.
@@ -307,7 +285,7 @@ void Partition(raft::handle_t const& handle,
                size_t n_components,
                EigenSolver const& eigen_solver,
                weight_t* eigVals,
-               weight_t* eigVecs)
+               weight_t* eig_vecs)
 {
   auto cublas_h = handle.get_cublas_handle();
   auto stream   = handle.get_stream();
@@ -328,9 +306,9 @@ void Partition(raft::handle_t const& handle,
   coo_view_t<vertex_t, weight_t>{laplacian}.toCSR(handle, &csr);
 
   auto r_csr_m = raft::spectral::matrix::sparse_matrix_t<vertex_t, weight_t>(csr);
-  eigen_solver.solve_largest_eigenvectors(handle, r_csr_m, eigVals, eigVecs);
+  eigen_solver.solve_largest_eigenvectors(handle, r_csr_m, eigVals, eig_vecs);
 
-  raft::device_matrix_view<float> eig_vectors(eigVecs, n_components, n_samples);
+  raft::device_matrix_view<float> eig_vectors(eig_vecs, n_components, n_samples);
   auto permutation = raft::make_device_matrix<float>(handle, n_components, n_samples);
 
   it          = thrust::make_counting_iterator(0ul);
@@ -349,17 +327,16 @@ void Partition(raft::handle_t const& handle,
 
   auto d_diagonal = laplacian.diagonal_.data();
   it              = thrust::make_counting_iterator(0ul);
-  std::cout << "n_diagonal:" << laplacian.diagonal_.size() << std::endl;
   thrust::for_each(policy, it, it + n_samples * n_components, [=] HD(size_t i) {
     size_t cidx = i % n_samples;
     assert(d_diagonal[cidx] != 0);
-    eigVecs[i] /= d_diagonal[cidx];
+    eig_vecs[i] /= d_diagonal[cidx];
   });
 
   {
     // deterministic vector sign flip
     auto abs_it =
-      thrust::make_transform_iterator(eigVecs, [=] HD(float v) -> float { return std::abs(v); });
+      thrust::make_transform_iterator(eig_vecs, [=] HD(float v) -> float { return std::abs(v); });
     auto key_it =
       thrust::make_transform_iterator(it, [=] HD(size_t i) -> size_t { return i % n_samples; });
     auto signs = raft::make_device_vector<float>(n_components, stream);
@@ -379,7 +356,7 @@ void Partition(raft::handle_t const& handle,
     auto signs_v = signs.view();
     thrust::for_each(policy, it, it + n_components * n_samples, [=] __device__(size_t i) {
       auto ridx = i / n_samples;
-      eigVecs[i] *= signs_v(ridx);
+      eig_vecs[i] *= signs_v(ridx);
     });
   }
 }
