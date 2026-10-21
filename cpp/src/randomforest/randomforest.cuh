@@ -310,6 +310,15 @@ class RandomForest {
     bool distributed =
       raft::resource::comms_initialized(handle) && handle.get_comms().get_size() > 1;
     this->error_checking(input, labels, n_rows, n_cols, false, distributed);
+    if constexpr (std::is_floating_point_v<L>) {
+      RAFT_EXPECTS(n_unique_labels >= 1, "n_outputs must be positive");
+      RAFT_EXPECTS(n_unique_labels == 1 || !distributed,
+                   "Multi-output regression does not support distributed training");
+      RAFT_EXPECTS(n_unique_labels == 1 ||
+                     this->rf_params.tree_params.split_criterion == CRITERION::MSE ||
+                     this->rf_params.tree_params.split_criterion == CRITERION::CRITERION_END,
+                   "Multi-output regression only supports the MSE split criterion");
+    }
     std::int64_t const n_rows_i64 = n_rows;
     std::int64_t n_sampled_rows   = 0;
     if (this->rf_params.bootstrap) {
@@ -414,6 +423,8 @@ class RandomForest {
   {
     ML::default_logger().set_level(verbosity);
     this->error_checking(input, predictions, n_rows, n_cols, true);
+    RAFT_EXPECTS(rf_type == RF_type::CLASSIFICATION || forest->trees[0]->num_outputs == 1,
+                 "Multi-output regression supports training and Treelite export only");
     std::vector<L> h_predictions(n_rows);
     cudaStream_t stream = user_handle.get_stream().get();
 

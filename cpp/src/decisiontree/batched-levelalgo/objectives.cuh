@@ -160,18 +160,14 @@ class ClassificationObjectiveFunction {
   DI std::int64_t NumClasses() const { return nclasses; }
 
   template <typename DatasetT>
-  DI void IncrementHistogram(BinT* histogram,
-                             int n_bins,
-                             int bin,
-                             LabelT label,
-                             const DatasetT& dataset,
-                             std::int64_t row) const
+  DI void IncrementHistogram(
+    BinT* histogram, int n_bins, int bin, const DatasetT& dataset, std::int64_t row) const
   {
     double weight = 1.0;
     if constexpr (weighted) {
       weight = dataset.sample_weight == nullptr ? 1.0 : double(dataset.sample_weight[row]);
     }
-    BinT::IncrementHistogram(histogram, n_bins, bin, label, weight);
+    BinT::IncrementHistogram(histogram, n_bins, bin, dataset.labels[row], weight);
   }
 
   DI Split<DataT> Gain(BinT const* shist,
@@ -225,6 +221,7 @@ class RegressionObjectiveFunction {
   static constexpr bool weighted = weighted_;
 
  private:
+  std::int64_t num_outputs;
   std::int64_t min_samples_leaf;
   CRITERION criterion;
   DataT min_impurity_decrease;
@@ -366,7 +363,17 @@ class RegressionObjectiveFunction {
       return -std::numeric_limits<DataT>::max();
 
     switch (criterion) {
-      case CRITERION::MSE: return MSEGain(hist, i, n_bins, len, nLeft, nRight);
+      case CRITERION::MSE: {
+        // Average the reduction across targets so the impurity threshold is independent
+        // of the number of outputs. Each target uses the same candidate split.
+        DataT gain = 0;
+        for (std::int64_t k = 0; k < num_outputs; ++k) {
+          auto target_gain = MSEGain(hist + k * n_bins, i, n_bins, len, nLeft, nRight);
+          if (target_gain == -std::numeric_limits<DataT>::max()) return target_gain;
+          gain += target_gain / DataT(num_outputs);
+        }
+        return gain;
+      }
       case CRITERION::POISSON: return PoissonGain(hist, i, n_bins, len, nLeft, nRight);
       case CRITERION::GAMMA: return GammaGain(hist, i, n_bins, len, nLeft, nRight);
       case CRITERION::INVERSE_GAUSSIAN:
@@ -375,33 +382,33 @@ class RegressionObjectiveFunction {
     }
   }
 
-  HDI RegressionObjectiveFunction(std::int64_t,
+  HDI RegressionObjectiveFunction(std::int64_t num_outputs,
                                   std::int64_t min_samples_leaf,
                                   CRITERION criterion,
                                   double root_weight,
                                   DataT min_impurity_decrease = DataT{0})
-    : min_samples_leaf(min_samples_leaf),
+    : num_outputs(num_outputs),
+      min_samples_leaf(min_samples_leaf),
       criterion(criterion),
       min_impurity_decrease(min_impurity_decrease),
       root_weight(root_weight)
   {
   }
 
-  DI std::int64_t NumClasses() const { return 1; }
+  DI std::int64_t NumClasses() const { return num_outputs; }
 
   template <typename DatasetT>
-  DI void IncrementHistogram(BinT* histogram,
-                             int n_bins,
-                             int bin,
-                             LabelT label,
-                             const DatasetT& dataset,
-                             std::int64_t row) const
+  DI void IncrementHistogram(
+    BinT* histogram, int n_bins, int bin, const DatasetT& dataset, std::int64_t row) const
   {
     double weight = 1.0;
     if constexpr (weighted) {
       weight = dataset.sample_weight == nullptr ? 1.0 : double(dataset.sample_weight[row]);
     }
-    BinT::IncrementHistogram(histogram, n_bins, bin, label, weight);
+    for (std::int64_t k = 0; k < num_outputs; ++k) {
+      BinT::IncrementHistogram(
+        histogram + k * n_bins, n_bins, bin, dataset.labels[row * num_outputs + k], weight);
+    }
   }
 
   DI Split<DataT> Gain(BinT const* shist,

@@ -259,15 +259,18 @@ void build_treelite_forest(TreeliteModelHandle* model_handle,
     model->task_type     = tl::TaskType::kMultiClf;
     model->postprocessor = "identity_multiclass";
   } else {
-    ASSERT(num_outputs == 1, "Only one variable expected for regression problem.");
     model->task_type     = tl::TaskType::kRegressor;
     model->postprocessor = "identity";
   }
 
-  model->num_target        = 1;
-  model->num_class         = std::vector<std::int32_t>{static_cast<std::int32_t>(num_outputs)};
-  model->leaf_vector_shape = std::vector<std::int32_t>{1, static_cast<std::int32_t>(num_outputs)};
-  model->target_id         = std::vector<std::int32_t>(forest->rf_params.n_trees, 0);
+  constexpr bool is_classifier = std::is_integral_v<L>;
+  model->num_target            = is_classifier ? 1 : num_outputs;
+  model->num_class             = is_classifier ? std::vector<std::int32_t>{num_outputs}
+                                               : std::vector<std::int32_t>(num_outputs, 1);
+  model->leaf_vector_shape     = is_classifier ? std::vector<std::int32_t>{1, num_outputs}
+                                               : std::vector<std::int32_t>{num_outputs, 1};
+  model->target_id             = std::vector<std::int32_t>(forest->rf_params.n_trees,
+                                               !is_classifier && num_outputs > 1 ? -1 : 0);
   model->class_id =
     std::vector<std::int32_t>(forest->rf_params.n_trees, (std::is_integral_v<L> ? -1 : 0));
   model->num_feature         = num_features;
@@ -597,8 +600,8 @@ RF_params set_rf_params(int max_depth,
  *   by default, or row-major when `input_row_major` is true. Device pointer.
  * @param[in] n_rows: number of training data samples.
  * @param[in] n_cols: number of features (i.e., columns) excluding target feature.
- * @param[in] labels: 1D array of target features (float or double), with one label per
- *   training sample. Device pointer.
+ * @param[in] labels: Row-major [n_rows, n_outputs] target array. Device pointer.
+ * @param[in] n_outputs: Number of regression targets (MSE only for multiple targets).
  * @param[in] rf_params: Random Forest training hyper parameter struct.
  * @param[in] verbosity: verbosity level for logging messages during execution
  * @param[in] input_row_major: whether input training data is row-major instead of the default
@@ -615,7 +618,8 @@ void fit(const raft::handle_t& user_handle,
          rapids_logger::level_enum verbosity,
          bool* bootstrap_masks,
          const double* sample_weight,
-         bool input_row_major)
+         bool input_row_major,
+         int n_outputs)
 {
   raft::common::nvtx::range fun_scope("RF::fit @randomforest.cu");
   ML::default_logger().set_level(verbosity);
@@ -630,7 +634,7 @@ void fit(const raft::handle_t& user_handle,
                     n_rows,
                     n_cols,
                     labels,
-                    1,
+                    n_outputs,
                     forest,
                     bootstrap_masks,
                     sample_weight,
@@ -647,7 +651,8 @@ void fit(const raft::handle_t& user_handle,
          rapids_logger::level_enum verbosity,
          bool* bootstrap_masks,
          const double* sample_weight,
-         bool input_row_major)
+         bool input_row_major,
+         int n_outputs)
 {
   raft::common::nvtx::range fun_scope("RF::fit @randomforest.cu");
   ML::default_logger().set_level(verbosity);
@@ -662,7 +667,7 @@ void fit(const raft::handle_t& user_handle,
                     n_rows,
                     n_cols,
                     labels,
-                    1,
+                    n_outputs,
                     forest,
                     bootstrap_masks,
                     sample_weight,
@@ -681,7 +686,8 @@ void fit_treelite(const raft::handle_t& user_handle,
                   value_t* feature_importances,
                   rapids_logger::level_enum verbosity,
                   const double* sample_weight,
-                  bool input_row_major)
+                  bool input_row_major,
+                  int n_outputs)
 {
   RandomForestMetaData<value_t, label_t> metadata;
   fit(user_handle,
@@ -694,7 +700,8 @@ void fit_treelite(const raft::handle_t& user_handle,
       verbosity,
       bootstrap_masks,
       sample_weight,
-      input_row_major);
+      input_row_major,
+      n_outputs);
 
   // Compute feature importances if requested
   if (feature_importances != nullptr) {
@@ -942,7 +949,8 @@ template CUML_EXPORT void fit_treelite<float, float>(const raft::handle_t& user_
                                                      float* feature_importances,
                                                      rapids_logger::level_enum verbosity,
                                                      const double* sample_weight,
-                                                     bool input_row_major);
+                                                     bool input_row_major,
+                                                     int n_outputs);
 template CUML_EXPORT void fit_treelite<double, double>(const raft::handle_t& user_handle,
                                                        TreeliteModelHandle* model,
                                                        double* input,
@@ -954,5 +962,6 @@ template CUML_EXPORT void fit_treelite<double, double>(const raft::handle_t& use
                                                        double* feature_importances,
                                                        rapids_logger::level_enum verbosity,
                                                        const double* sample_weight,
-                                                       bool input_row_major);
+                                                       bool input_row_major,
+                                                       int n_outputs);
 }  // End namespace ML

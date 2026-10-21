@@ -250,6 +250,10 @@ class DecisionTree {
         (std::numeric_limits<LabelT>::is_integer) ? CRITERION::GINI : CRITERION::MSE;
       params.split_criterion = default_criterion;
     }
+    if constexpr (std::is_floating_point_v<LabelT>) {
+      RAFT_EXPECTS(unique_labels == 1 || params.split_criterion == CRITERION::MSE,
+                   "Multi-output regression only supports the MSE split criterion");
+    }
     // Dispatch objective family. The objective object switches on the criterion at runtime.
     if (not std::is_same<DataT, LabelT>::value and (params.split_criterion == CRITERION::GINI ||
                                                     params.split_criterion == CRITERION::ENTROPY)) {

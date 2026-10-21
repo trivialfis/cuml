@@ -115,7 +115,8 @@ cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
         T* feature_importances,
         level_enum verbosity,
         const double* sample_weight,
-        bool input_row_major
+        bool input_row_major,
+        int n_outputs
     ) except +
 
 
@@ -416,11 +417,17 @@ class BaseRandomForestModel(InteropMixin, Base):
             A forest inference model which can be used to perform
             inferencing on the random forest model.
         """
+        check_is_fitted(self)
+
+        if self._estimator_type == "regressor" and self.n_outputs_ > 1:
+            raise NotImplementedError(
+                "GPU prediction for multi-output regression is not supported. "
+                "Use as_treelite() to export the trained model."
+            )
+
         handle = get_handle()
         cdef handle_t* handle_ = <handle_t*><uintptr_t>handle.getHandle()
         cdef cudaStream_t stream = handle_.get_stream().get()
-
-        check_is_fitted(self)
 
         return nvforest.load_from_treelite_model(
             tl_model=treelite.Model.deserialize_bytes(self._treelite_model_bytes),
@@ -434,6 +441,17 @@ class BaseRandomForestModel(InteropMixin, Base):
     def _fit_forest(self, X, y, sample_weight=None):
         cdef bool is_classifier = self._estimator_type == "classifier"
         cdef bool is_float32 = X.dtype == np.float32
+        cdef int n_outputs = 1 if is_classifier or y.ndim == 1 else y.shape[1]
+        cdef CRITERION split_criterion = _normalize_split_criterion(self.split_criterion)
+        if n_outputs > 1:
+            if split_criterion not in (MSE, CRITERION_END):
+                raise ValueError("Multi-output regression only supports the MSE split criterion")
+            if getattr(self, "_raft_handle", None) is not None:
+                raise ValueError("Multi-output regression does not support distributed training")
+            if self.oob_score:
+                raise ValueError("OOB scoring is not supported for multi-output regression")
+            # The tree kernels consume targets in row-major order, independently of X.
+            y = cp.ascontiguousarray(y)
 
         cdef uintptr_t X_ptr = X.data.ptr
         cdef uintptr_t y_ptr = y.data.ptr
@@ -523,7 +541,7 @@ class BaseRandomForestModel(InteropMixin, Base):
             self.n_estimators,
             self.max_samples,
             seed,
-            _normalize_split_criterion(self.split_criterion),
+            split_criterion,
             n_streams_c,
             self.max_batch_size,
         )
@@ -597,7 +615,8 @@ class BaseRandomForestModel(InteropMixin, Base):
                         <float*> feature_importances_ptr,
                         verbose,
                         <const double*> sample_weight_ptr,
-                        input_row_major
+                        input_row_major,
+                        n_outputs
                     )
                 else:
                     fit_treelite(
@@ -612,7 +631,8 @@ class BaseRandomForestModel(InteropMixin, Base):
                         <double*> feature_importances_ptr,
                         verbose,
                         <const double*> sample_weight_ptr,
-                        input_row_major
+                        input_row_major,
+                        n_outputs
                     )
 
         # XXX: Theoretically we could wrap `tl_handle` with `treelite.Model` to
@@ -637,10 +657,12 @@ class BaseRandomForestModel(InteropMixin, Base):
             self._n_samples if self.max_samples is None
             else max(round(self._n_samples * self.max_samples), 1)
         )
-        self.n_outputs_ = 1
+        self.n_outputs_ = n_outputs
         self._treelite_model_bytes = <bytes>(tl_bytes[:tl_bytes_len])
-        # Reload nvforest model
-        self._nvforest_model = self.as_nvforest()
+        # Training/export of multi-output regressors does not require nvForest.
+        self.__dict__.pop("_nvforest_model", None)
+        if n_outputs == 1:
+            self._nvforest_model = self.as_nvforest()
 
         # Compute OOB score if requested
         if self.oob_score:

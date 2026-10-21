@@ -30,6 +30,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <type_traits>
 
 namespace ML {
 namespace DT {
@@ -234,9 +235,8 @@ CUML_KERNEL void buildLeafHistogramsKernel(ObjectiveT objective,
   }
   __syncthreads();
   for (auto i = range.begin + tid; i < range.begin + range.count; i += blockDim.x) {
-    auto row   = dataset.row_ids[i];
-    auto label = dataset.labels[row];
-    objective.IncrementHistogram(histogram, 1, 0, label, dataset, row);
+    auto row = dataset.row_ids[i];
+    objective.IncrementHistogram(histogram, 1, 0, dataset, row);
   }
   __syncthreads();
   for (int i = tid; i < dataset.num_outputs; i += blockDim.x) {
@@ -362,9 +362,8 @@ CUML_KERNEL void buildHistogramsKernel(typename ObjectiveT::BinT* histograms,
   }
 
   for (auto i = range_start + tid; i < end; i += stride) {
-    auto row   = dataset.row_ids[i];
-    auto data  = dataset.value(row, col);
-    auto label = dataset.labels[row];
+    auto row  = dataset.row_ids[i];
+    auto data = dataset.value(row, col);
 
     // Search bin indices so lower_bound uses 32-bit distance and advance arithmetic.
     auto bin_begin = cuda::counting_iterator<int, int>(0);
@@ -374,7 +373,7 @@ CUML_KERNEL void buildHistogramsKernel(typename ObjectiveT::BinT* histograms,
         return quantiles_for_split[bin] < value;
       });
     auto bin = bin_it == bin_end ? n_bins - 1 : *bin_it;
-    objective.IncrementHistogram(histogram, n_bins, bin, label, dataset, row);
+    objective.IncrementHistogram(histogram, n_bins, bin, dataset, row);
   }
 
   if (!use_global_memory_histogram) {
@@ -415,8 +414,11 @@ CUML_KERNEL void findBestSplitsKernel(typename ObjectiveT::BinT* histograms,
 
   std::int64_t global_sample_count = 0;
   for (std::int64_t c = 0; c < n_classes; ++c) {
-    global_sample_count +=
+    auto count =
       static_cast<std::int64_t>(pdf_to_cdf<BinT, TPB>(histogram + n_bins * c, n_bins).Count());
+    // Class histograms partition the samples; regression target histograms each
+    // contain all samples. Still prefix-scan every target, but count rows only once.
+    if (std::is_integral_v<LabelT> || c == 0) { global_sample_count += count; }
   }
 
   __syncthreads();

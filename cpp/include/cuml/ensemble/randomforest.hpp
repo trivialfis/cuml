@@ -258,7 +258,8 @@ void fit(const raft::handle_t& user_handle,
          rapids_logger::level_enum verbosity = rapids_logger::level_enum::info,
          bool* bootstrap_masks               = nullptr,
          const double* sample_weight         = nullptr,
-         bool input_row_major                = false);
+         bool input_row_major                = false,
+         int n_outputs                       = 1);
 void fit(const raft::handle_t& user_handle,
          RandomForestRegressorD* forest,
          double* input,
@@ -269,7 +270,8 @@ void fit(const raft::handle_t& user_handle,
          rapids_logger::level_enum verbosity = rapids_logger::level_enum::info,
          bool* bootstrap_masks               = nullptr,
          const double* sample_weight         = nullptr,
-         bool input_row_major                = false);
+         bool input_row_major                = false,
+         int n_outputs                       = 1);
 
 /**
  * @brief Train a random forest regressor and export it as a Treelite model.
@@ -280,13 +282,14 @@ void fit(const raft::handle_t& user_handle,
  *   input_row_major is true.
  * @param[in] n_rows Number of rows in input.
  * @param[in] n_cols Number of columns in input.
- * @param[in] labels Training labels.
+ * @param[in] labels Row-major training targets with shape [n_rows, n_outputs].
  * @param[in] rf_params Random forest training parameters.
  * @param[in] bootstrap_masks Optional bootstrap masks.
  * @param[out] feature_importances Output feature importances.
  * @param[in] verbosity Logging verbosity.
  * @param[in] sample_weight Optional per-row sample weights.
  * @param[in] input_row_major Whether input is row-major instead of column-major.
+ * @param[in] n_outputs Number of regression targets. Multiple targets require MSE and a single GPU.
  */
 template <typename T, typename L>
 void fit_treelite(const raft::handle_t& user_handle,
@@ -300,7 +303,8 @@ void fit_treelite(const raft::handle_t& user_handle,
                   T* feature_importances,
                   rapids_logger::level_enum verbosity,
                   const double* sample_weight = nullptr,
-                  bool input_row_major        = false);
+                  bool input_row_major        = false,
+                  int n_outputs               = 1);
 
 void predict(const raft::handle_t& user_handle,
              const RandomForestRegressorF* forest,

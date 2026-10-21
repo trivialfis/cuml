@@ -22,6 +22,13 @@ class RandomForestRegressor(RegressorMixin, BaseRandomForestModel):
       https://docs.nvidia.com/cuml/latest/pickling_cuml_models/
       for more details.
 
+    .. note:: Multi-output regression accepts targets of shape
+      ``(n_samples, n_outputs)`` for single-GPU training with ``split_criterion='mse'``.
+      Each tree shares its splits across targets, minimizing their average squared
+      error, and stores a vector of target means at each leaf. Use ``as_treelite()``
+      to export the trained model. GPU prediction, scoring, OOB scoring, and
+      distributed training are not yet supported for multiple targets.
+
     Examples
     --------
 
@@ -204,7 +211,7 @@ class RandomForestRegressor(RegressorMixin, BaseRandomForestModel):
         message="fit RF-Regressor @randomforestregressor.py",
         domain="cuml_python",
     )
-    @generate_docstring()
+    @generate_docstring(y_shape="(n_samples,) or (n_samples, n_outputs)")
     @mlfunc(set_input_type=True)
     def fit(self, X, y, sample_weight=None) -> "RandomForestRegressor":
         """
@@ -215,16 +222,27 @@ class RandomForestRegressor(RegressorMixin, BaseRandomForestModel):
         return self._fit_forest(X, y, sample_weight=sample_weight)
 
     def _prepare_fit_inputs(self, X, y, sample_weight=None):
-        return check_inputs(
+        X, y, sample_weight = check_inputs(
             self,
             X,
             y,
             sample_weight,
             dtype=("float32", "float64"),
             order="A",
+            accept_multi_output=True,
             sample_weight_dtype="float64",
             reset=True,
         )
+        if (
+            y.ndim == 2
+            and y.shape[1] > 1
+            and getattr(self, "_raft_handle", None) is not None
+        ):
+            # Dask validates inputs on every worker before entering training collectives.
+            raise ValueError(
+                "Multi-output regression does not support distributed training"
+            )
+        return X, y, sample_weight
 
     @nvtx.annotate(
         message="predict RF-Regressor @randomforestregressor.py",

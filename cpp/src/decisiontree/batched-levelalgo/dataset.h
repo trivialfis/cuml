@@ -16,7 +16,7 @@ template <typename DataT, typename LabelT>
 struct Dataset {
   /** input dataset */
   const DataT* data;
-  /** input labels */
+  /** input labels: one class per row, or row-major [n_rows, num_outputs] regression targets */
   const LabelT* labels;
   /** optional input sample weights */
   const double* sample_weight;

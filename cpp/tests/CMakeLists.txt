@@ -148,6 +148,12 @@ if(BUILD_CUML_TESTS AND (all_algo OR randomforest_algo))
     GPUS 1
     PERCENT 100
   )
+  ConfigureTest(
+    PREFIX SG
+    NAME RF_MULTIOUTPUT_TEST sg/rf_multioutput_test.cu ML_INCLUDE
+    GPUS 1
+    PERCENT 100
+  )
 endif()
 
 if(all_algo OR isolationforest_algo)
