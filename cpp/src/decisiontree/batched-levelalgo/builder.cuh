@@ -196,8 +196,6 @@ struct Builder {
   std::int64_t treeid;
   /** Seed used for randomization */
   uint64_t seed;
-  /** number of nodes created in the current batch */
-  std::int64_t* n_nodes;
   /** buffer of segmented histograms*/
   BinT* histograms;
   /** mutex array used for atomically updating best split */
@@ -334,7 +332,6 @@ struct Builder {
     auto partition_row_ids_bytes =
       ML::checked_mul<std::size_t>(sizeof(std::int64_t), dataset.n_sampled_rows);
 
-    d_wsize += calculateAlignedBytes(sizeof(std::int64_t));     // n_nodes
     d_wsize += calculateAlignedBytes(histograms_bytes);         // histograms
     d_wsize += calculateAlignedBytes(mutex_bytes);              // mutex
     d_wsize += calculateAlignedBytes(splits_bytes);             // splits
@@ -375,8 +372,6 @@ struct Builder {
     auto partition_row_ids_bytes =
       ML::checked_mul<std::size_t>(sizeof(std::int64_t), dataset.n_sampled_rows);
     // device
-    n_nodes = reinterpret_cast<std::int64_t*>(d_wspace);
-    d_wspace += calculateAlignedBytes(sizeof(std::int64_t));
     histograms = reinterpret_cast<BinT*>(d_wspace);
     d_wspace += calculateAlignedBytes(histograms_bytes);
     mutex = reinterpret_cast<int*>(d_wspace);
@@ -506,9 +501,6 @@ struct Builder {
                                      double root_weight)
   {
     raft::common::nvtx::range fun_scope("Builder::evaluateSplits @builder.cuh [batched-levelalgo]");
-    // start fresh on the number of *new* nodes created in this batch
-    RAFT_CUDA_TRY(cudaMemsetAsync(n_nodes, 0, sizeof(std::int64_t), builder_stream));
-
     const std::int64_t original_n_sampled_cols = dataset.n_sampled_cols;
     ASSERT(original_n_sampled_cols > 0 && original_n_sampled_cols <= dataset.n_cols,
            "n_sampled_cols must be in [1, n_cols]");
