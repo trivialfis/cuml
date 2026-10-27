@@ -204,6 +204,8 @@ struct Builder {
   SplitT* splits;
   /** current batch of nodes */
   NodeWorkItem* d_work_items;
+  /** pinned staging buffer for work-item uploads */
+  NodeWorkItem* h_work_items;
   /** device AOS to map CTA blocks along dimx to nodes of a batch */
   WorkloadInfo* workload_info;
   /** host AOS to map CTA blocks along dimx to nodes of a batch */
@@ -344,6 +346,7 @@ struct Builder {
     // all nodes in the tree
     h_wsize += calculateAlignedBytes(workload_info_bytes);  // h_workload_info
     h_wsize += calculateAlignedBytes(splits_bytes);         // splits
+    h_wsize += calculateAlignedBytes(work_items_bytes);     // h_work_items
 
     return std::make_pair(d_wsize, h_wsize);
   }
@@ -396,6 +399,8 @@ struct Builder {
     h_wspace += calculateAlignedBytes(workload_info_bytes);
     h_splits = reinterpret_cast<SplitT*>(h_wspace);
     h_wspace += calculateAlignedBytes(splits_bytes);
+    h_work_items = reinterpret_cast<NodeWorkItem*>(h_wspace);
+    h_wspace += calculateAlignedBytes(work_items_bytes);
   }
 
   /**
@@ -555,10 +560,11 @@ struct Builder {
   {
     // Partition samples once, using the valid split found for each node. Nodes
     // still without a valid split after all features have been visited remain leaves.
-    auto split_copy_bytes = ML::checked_mul<std::size_t>(sizeof(SplitT), work_items.size());
-    RAFT_CUDA_TRY(cudaMemcpyAsync(
-      splits, final_splits.data(), split_copy_bytes, cudaMemcpyHostToDevice, builder_stream));
-    raft::update_device(d_work_items, work_items.data(), work_items.size(), builder_stream);
+    // The stream sync below makes these pinned buffers safe to reuse on the next call.
+    std::copy(final_splits.begin(), final_splits.end(), h_splits);
+    raft::update_device(splits, h_splits, final_splits.size(), builder_stream);
+    std::copy(work_items.begin(), work_items.end(), h_work_items);
+    raft::update_device(d_work_items, h_work_items, work_items.size(), builder_stream);
     const auto n_partition_blocks = this->updateWorkloadInfo(work_items);
     raft::common::nvtx::push_range("nodeSplitKernel @builder.cuh [batched-levelalgo]");
     launchNodeSplitKernel<DataT, LabelT, TPB_DEFAULT>(dataset,
@@ -583,7 +589,8 @@ struct Builder {
     initSplit<DataT, TPB_DEFAULT>(splits, work_items.size(), builder_stream);
     auto mutex_bytes = ML::checked_mul<std::size_t>(sizeof(int), params.max_batch_size);
     RAFT_CUDA_TRY(cudaMemsetAsync(mutex, 0, mutex_bytes, builder_stream));
-    raft::update_device(d_work_items, work_items.data(), work_items.size(), builder_stream);
+    std::copy(work_items.begin(), work_items.end(), h_work_items);
+    raft::update_device(d_work_items, h_work_items, work_items.size(), builder_stream);
     auto n_blocks_dimx     = this->updateWorkloadInfo(work_items);
     auto split_smem_config = computeSharedMemoryConfig();
 
