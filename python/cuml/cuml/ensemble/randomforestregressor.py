@@ -228,6 +228,7 @@ class RandomForestRegressor(RegressorMixin, BaseRandomForestModel):
             order="A",
             sample_weight_dtype="float64",
             sample_weight_allow_all_zero=sample_weight_allow_all_zero,
+            accept_multi_output=True,
             reset=True,
         )
 
