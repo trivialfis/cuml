@@ -175,6 +175,7 @@ void fit(const raft::handle_t& user_handle,
          int n_rows,
          int n_cols,
          float* labels,
+         int n_outputs,
          RF_params rf_params,
          rapids_logger::level_enum verbosity = rapids_logger::level_enum::info,
          bool* bootstrap_masks               = nullptr,
@@ -186,6 +187,7 @@ void fit(const raft::handle_t& user_handle,
          int n_rows,
          int n_cols,
          double* labels,
+         int n_outputs,
          RF_params rf_params,
          rapids_logger::level_enum verbosity = rapids_logger::level_enum::info,
          bool* bootstrap_masks               = nullptr,
@@ -201,13 +203,14 @@ void fit(const raft::handle_t& user_handle,
  *   input_row_major is true.
  * @param[in] n_rows Number of rows in input.
  * @param[in] n_cols Number of columns in input.
- * @param[in] labels Training labels.
+ * @param[in] labels Column-major training targets of shape (n_rows, n_outputs).
  * @param[in] rf_params Random forest training parameters.
  * @param[in] bootstrap_masks Optional bootstrap masks.
  * @param[out] feature_importances Output feature importances.
  * @param[in] verbosity Logging verbosity.
  * @param[in] sample_weight Optional per-row sample weights.
  * @param[in] input_row_major Whether input is row-major instead of column-major.
+ * @param[in] n_outputs Number of regression targets. The training backend currently supports one.
  */
 template <typename T, typename L>
 void fit_treelite(const raft::handle_t& user_handle,

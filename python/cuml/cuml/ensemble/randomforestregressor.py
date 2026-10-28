@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import cupy as cp
+
 import cuml.internals.nvtx as nvtx
 from cuml.common.doc_utils import generate_docstring, insert_into_docstring
 from cuml.ensemble.randomforest_common import BaseRandomForestModel
@@ -219,7 +221,7 @@ class RandomForestRegressor(RegressorMixin, BaseRandomForestModel):
         sample_weight_allow_all_zero = (
             hasattr(self, "_distributed_n_rows") and self.bootstrap
         )
-        return check_inputs(
+        X, y, sample_weight = check_inputs(
             self,
             X,
             y,
@@ -231,6 +233,8 @@ class RandomForestRegressor(RegressorMixin, BaseRandomForestModel):
             accept_multi_output=True,
             reset=True,
         )
+        # Regression targets are column-major independently of the feature layout.
+        return X, cp.asfortranarray(y), sample_weight
 
     @nvtx.annotate(
         message="predict RF-Regressor @randomforestregressor.py",

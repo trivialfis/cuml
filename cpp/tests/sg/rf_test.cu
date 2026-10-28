@@ -411,6 +411,7 @@ auto TrainScore(const raft::handle_t& handle,
         params.n_rows,
         params.n_cols,
         y,
+        1,
         rf_params,
         rapids_logger::level_enum::info,
         nullptr,
@@ -839,7 +840,7 @@ TEST(RfTests, IntegerOverflow)
   raft::handle_t handle(cuda::stream_ref{cudaStreamPerThread}, stream_pool);
   RF_params rf_params =
     set_rf_params(3, 100, 1.0, 256, 1, 2, 0.0, false, 1, 1.0, 0, CRITERION::MSE, 4, 128);
-  fit(handle, forest_ptr, X.data().get(), m, n, y.data().get(), rf_params);
+  fit(handle, forest_ptr, X.data().get(), m, n, y.data().get(), 1, rf_params);
 
   // Check we have actually learned something
   EXPECT_GT(forest->trees[0]->leaf_counter, 1);
@@ -886,7 +887,7 @@ TEST(RfTests, EmptyGlobalRowsRejected)
   RF_params rf_params =
     set_rf_params(3, 100, 1.0, 16, 1, 2, 0.0, false, 1, 1.0, 0, CRITERION::MSE, 1, 128);
 
-  EXPECT_THROW(fit(handle, forest_ptr, X.data().get(), 0, 1, y.data().get(), rf_params),
+  EXPECT_THROW(fit(handle, forest_ptr, X.data().get(), 0, 1, y.data().get(), 1, rf_params),
                raft::exception);
 }
 
@@ -1605,7 +1606,7 @@ TEST(RfTest, GreedyGrowthSplitsLeafWithLargestImprovement)
     auto params =
       set_rf_params(8, max_leaves, 1.0, 12, 1, 2, 0.0, false, 1, 1.0, 0, MSE, 1, max_batch_size);
     RandomForestMetaData<float, float> forest;
-    fit(handle, &forest, X.data().get(), y.size(), 1, y.data().get(), params);
+    fit(handle, &forest, X.data().get(), y.size(), 1, y.data().get(), 1, params);
 
     const auto& tree = forest.trees[0]->sparsetree;
     ASSERT_EQ(tree.size(), 7);
@@ -1720,6 +1721,7 @@ TEST(RfWeightedTest, RegressionRootLeafUsesWeights)
       y.size(),
       1,
       y.data().get(),
+      1,
       rf_params,
       rapids_logger::level_enum::info,
       nullptr,
@@ -1834,6 +1836,7 @@ TEST(RfWeightedTest, BootstrapDuplicatesContributePerOccurrence)
         n_rows,
         1,
         y.data().get(),
+        1,
         rf_params,
         rapids_logger::level_enum::info,
         bootstrap_masks.data(),

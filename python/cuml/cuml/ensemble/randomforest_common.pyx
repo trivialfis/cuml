@@ -115,7 +115,8 @@ cdef extern from "cuml/ensemble/randomforest.hpp" namespace "ML" nogil:
         T* feature_importances,
         level_enum verbosity,
         const double* sample_weight,
-        bool input_row_major
+        bool input_row_major,
+        int n_outputs
     ) except +
 
 
@@ -471,6 +472,7 @@ class BaseRandomForestModel(InteropMixin, Base):
         )
         cdef level_enum verbose = <level_enum> self._verbose_level
         cdef int n_classes = self.n_classes_ if is_classifier else 0
+        cdef int n_outputs = 1 if is_classifier or y.ndim == 1 else y.shape[1]
         cdef bool input_row_major = not X.flags.f_contiguous
 
         cdef int max_depth_c
@@ -621,7 +623,8 @@ class BaseRandomForestModel(InteropMixin, Base):
                         <float*> feature_importances_ptr,
                         verbose,
                         <const double*> sample_weight_ptr,
-                        input_row_major
+                        input_row_major,
+                        n_outputs
                     )
                 else:
                     fit_treelite(
@@ -636,7 +639,8 @@ class BaseRandomForestModel(InteropMixin, Base):
                         <double*> feature_importances_ptr,
                         verbose,
                         <const double*> sample_weight_ptr,
-                        input_row_major
+                        input_row_major,
+                        n_outputs
                     )
 
         # XXX: Theoretically we could wrap `tl_handle` with `treelite.Model` to
@@ -661,7 +665,7 @@ class BaseRandomForestModel(InteropMixin, Base):
             self._n_samples if self.max_samples is None
             else max(round(self._n_samples * self.max_samples), 1)
         )
-        self.n_outputs_ = 1
+        self.n_outputs_ = n_outputs
         self._treelite_model_bytes = <bytes>(tl_bytes[:tl_bytes_len])
         # Reload nvforest model
         self._nvforest_model = self.as_nvforest()
