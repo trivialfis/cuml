@@ -1700,9 +1700,11 @@ TEST(RfTest, GreedyGrowthSplitsLeafWithLargestImprovement)
   // The root separates the first two rows. Left improvement is 4 * 2/12;
   // right improvement is 1 * 10/12. Both policies can grow the full four-leaf tree,
   // but batched growth expands the left child first and greedy expands the right.
-  for (int max_leaves : {-1, 4}) {
+  for (auto [max_leaves, max_batch_size] : {std::pair{-1, 1}, {-1, 128}, {4, 1}, {4, 128}}) {
     SCOPED_TRACE(max_leaves);
-    auto params = set_rf_params(8, max_leaves, 1.0, 12, 1, 2, 0.0, false, 1, 1.0, 0, MSE, 1, 128);
+    SCOPED_TRACE(max_batch_size);
+    auto params =
+      set_rf_params(8, max_leaves, 1.0, 12, 1, 2, 0.0, false, 1, 1.0, 0, MSE, 1, max_batch_size);
     RandomForestMetaData<float, float> forest;
     fit(handle, &forest, X.data().get(), y.size(), 1, y.data().get(), params);
 

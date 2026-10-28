@@ -27,8 +27,8 @@
 #include <thrust/transform_reduce.h>
 
 #include <algorithm>
+#include <concepts>  // for floating_point
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <queue>
 #include <utility>
@@ -36,18 +36,37 @@
 
 namespace ML {
 namespace DT {
-
 /**
  * Structure that manages the iterative batched-level training and building of nodes
  * in the host.
  */
-template <typename DataT, typename LabelT>
+template <std::floating_point DataT, typename LabelT>
 class NodeQueue {
-  using NodeT = SparseTreeNode<DataT, LabelT>;
-  const DecisionTreeParams params;
+  using NodeT  = SparseTreeNode<DataT, LabelT>;
+  using SplitT = Split<DataT>;
+
+  struct Entry {
+    NodeWorkItem item;
+    SplitT split;
+  };
+
+  struct CompareEntries {
+    bool greedy;
+
+    bool operator()(Entry const& lhs, Entry const& rhs) const
+    {
+      if (greedy && lhs.split.weighted_impurity_decrease != rhs.split.weighted_impurity_decrease) {
+        return lhs.split.weighted_impurity_decrease < rhs.split.weighted_impurity_decrease;
+      }
+      // Nodes are appended in ID order, preserving FIFO batching and gain ties.
+      return lhs.item.idx > rhs.item.idx;
+    }
+  };
+
+  DecisionTreeParams const params;
   std::shared_ptr<DT::TreeMetaDataNode<DataT, LabelT>> tree;
   std::vector<InstanceRange> node_instances_;
-  std::deque<NodeWorkItem> work_items_;
+  std::priority_queue<Entry, std::vector<Entry>, CompareEntries> work_items_;
 
  public:
   NodeQueue(DecisionTreeParams params,
@@ -55,7 +74,9 @@ class NodeQueue {
             size_t local_sampled_rows,
             std::int64_t global_sampled_rows,
             int num_outputs)
-    : params(params), tree(std::make_shared<DT::TreeMetaDataNode<DataT, LabelT>>())
+    : params(params),
+      tree(std::make_shared<DT::TreeMetaDataNode<DataT, LabelT>>()),
+      work_items_(CompareEntries{params.isGreedy()})
   {
     tree->num_outputs = num_outputs;
     tree->sparsetree.reserve(max_nodes);
@@ -64,29 +85,45 @@ class NodeQueue {
     tree->depth_counter = 0;
     node_instances_.reserve(max_nodes);
     node_instances_.emplace_back(InstanceRange{0, local_sampled_rows});
-    if (this->IsExpandable(tree->sparsetree.back(), 0)) {
-      work_items_.emplace_back(NodeWorkItem{0, 0, node_instances_.back()});
-    }
   }
 
   std::shared_ptr<DT::TreeMetaDataNode<DataT, LabelT>> GetTree() { return tree; }
   const std::vector<InstanceRange>& GetInstanceRanges() { return node_instances_; }
 
-  bool HasWork() { return work_items_.size() > 0; }
-
-  auto Pop()
+  std::vector<NodeWorkItem> GetRootWorkItems() const
   {
-    std::vector<NodeWorkItem> result;
-    result.reserve(std::min(size_t(params.max_batch_size), work_items_.size()));
-    while (work_items_.size() > 0 && result.size() < std::size_t(params.max_batch_size)) {
-      result.emplace_back(work_items_.front());
-      work_items_.pop_front();
+    // Root items haven't be evaluated yet. Pop() returns *evaluated* candidates.
+    if (!IsExpandable(tree->sparsetree.front(), 0)) { return {}; }
+    return {{0, 0, node_instances_.front()}};
+  }
+
+  void Push(std::vector<NodeWorkItem> const& items, std::vector<SplitT> const& splits)
+  {
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      if (splits[i].IsValid()) { work_items_.push({items[i], splits[i]}); }
     }
-    return result;
+  }
+
+  std::pair<std::vector<NodeWorkItem>, std::vector<SplitT>> Pop()
+  {
+    if (params.isGreedy() && tree->leaf_counter >= params.max_leaves) { return {}; }
+    auto batch_size = params.isGreedy() ? std::size_t{1} : std::size_t(params.max_batch_size);
+    batch_size      = std::min(batch_size, work_items_.size());
+    std::vector<NodeWorkItem> items;
+    std::vector<SplitT> splits;
+    items.reserve(batch_size);
+    splits.reserve(batch_size);
+    // Preserve FIFO order across depth boundaries for depthwise growth.
+    while (items.size() < batch_size) {
+      items.push_back(work_items_.top().item);
+      splits.push_back(work_items_.top().split);
+      work_items_.pop();
+    }
+    return {std::move(items), std::move(splits)};
   }
 
   // This node is allowed to be expanded further (if its split gain is high enough)
-  bool IsExpandable(const NodeT& n, int depth)
+  bool IsExpandable(NodeT const& n, int depth) const
   {
     if (depth >= params.max_depth) return false;
     if (n.InstanceCount() < params.min_samples_split) return false;
@@ -94,17 +131,18 @@ class NodeQueue {
     return true;
   }
 
-  template <typename SplitT>
-  void Push(const std::vector<NodeWorkItem>& work_items, SplitT* h_splits)
+  std::vector<NodeWorkItem> ApplySplits(std::vector<NodeWorkItem> const& work_items,
+                                        SplitT const* h_splits)
   {
-    // Update node queue based on splits
+    std::vector<NodeWorkItem> children;
+    // Commit splits and collect eligible children for evaluation.
     for (std::size_t i = 0; i < work_items.size(); i++) {
       auto split        = h_splits[i];
       auto item         = work_items[i];
       auto parent_range = node_instances_.at(item.idx);
       if (!split.IsValid()) { continue; }
 
-      if (params.isGreedy() && tree->leaf_counter >= params.max_leaves) break;
+      if (params.isGreedy() && tree->leaf_counter >= params.max_leaves) { break; }
 
       using NodeCountT            = decltype(std::declval<NodeT>().InstanceCount());
       auto const parent_count     = tree->sparsetree.at(item.idx).InstanceCount();
@@ -124,7 +162,7 @@ class NodeQueue {
 
       // Do not add a work item if this child is definitely a leaf
       if (this->IsExpandable(tree->sparsetree.back(), item.depth + 1)) {
-        work_items_.emplace_back(
+        children.push_back(
           NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, node_instances_.back()});
       }
 
@@ -137,13 +175,14 @@ class NodeQueue {
 
       // Do not add a work item if this child is definitely a leaf
       if (this->IsExpandable(tree->sparsetree.back(), item.depth + 1)) {
-        work_items_.emplace_back(
+        children.push_back(
           NodeWorkItem{tree->sparsetree.size() - 1, item.depth + 1, node_instances_.back()});
       }
 
       // update depth
       tree->depth_counter = max(tree->depth_counter, item.depth + 1);
     }
+    return children;
   }
 };
 
@@ -159,21 +198,6 @@ struct Builder {
   typedef Split<DataT> SplitT;
   typedef Dataset<DataT, LabelT> DatasetT;
   typedef Quantiles<DataT> QuantilesT;
-
-  struct SplitCandidate {
-    NodeWorkItem item;
-    SplitT split;
-  };
-
-  struct CompareCandidates {
-    bool operator()(const SplitCandidate& lhs, const SplitCandidate& rhs) const
-    {
-      if (lhs.split.weighted_impurity_decrease != rhs.split.weighted_impurity_decrease) {
-        return lhs.split.weighted_impurity_decrease < rhs.split.weighted_impurity_decrease;
-      }
-      return lhs.item.idx > rhs.item.idx;
-    }
-  };
 
   /** default threads per block for most kernels in here */
   static constexpr int TPB_DEFAULT = 128;
@@ -426,37 +450,28 @@ struct Builder {
         cuda::std::plus{});
       root_weight = globalSum(local_weight);
     }
+
     NodeQueue<DataT, LabelT> queue(
       params, this->maxNodes(), dataset.n_sampled_rows, global_sampled_rows, dataset.num_outputs);
-    const bool greedy = params.isGreedy();
-    std::priority_queue<SplitCandidate, std::vector<SplitCandidate>, CompareCandidates> candidates;
-    while (queue.HasWork() || !candidates.empty()) {
-      if (greedy && queue.GetTree()->leaf_counter >= params.max_leaves) { break; }
-      std::vector<NodeWorkItem> work_items;
-      std::vector<SplitT> selected_splits;
-      if (greedy) {
-        // Evaluate all newly eligible children before selecting another split,
-        // even when max_batch_size is one. A child can outrank the old frontier.
-        while (queue.HasWork()) {
-          auto items = queue.Pop();
-          // Each iteration drains the queue, then commits one split with at most two children.
-          ASSERT(items.size() <= 2, "Greedy evaluation batches must contain at most two nodes.");
-          auto best_splits = evaluateSplits(items, root_weight);
-          for (std::size_t i = 0; i < items.size(); ++i) {
-            if (best_splits[i].IsValid()) { candidates.push({items[i], best_splits[i]}); }
-          }
-        }
-        if (candidates.empty()) { break; }
-        auto candidate = candidates.top();
-        candidates.pop();
-        work_items.push_back(candidate.item);
-        selected_splits.push_back(candidate.split);
-      } else {
-        work_items      = queue.Pop();
-        selected_splits = evaluateSplits(work_items, root_weight);
+    auto evaluate_and_enqueue = [&](std::vector<NodeWorkItem> const& children) {
+      // Greedy commits one split at a time, creating at most two children to evaluate.
+      ASSERT(!params.isGreedy() || children.size() <= 2,
+             "Greedy evaluation batches must contain at most two nodes.");
+      // Evaluate all new children before selecting another split, including when the
+      // batch size is one. Children can outrank candidates already in the queue.
+      for (std::size_t offset = 0; offset < children.size();) {
+        auto batch_size = std::min(std::size_t(params.max_batch_size), children.size() - offset);
+        std::vector<NodeWorkItem> items(children.begin() + offset,
+                                        children.begin() + offset + batch_size);
+        queue.Push(items, evaluateSplits(items, root_weight));
+        offset += batch_size;
       }
+    };
+    evaluate_and_enqueue(queue.GetRootWorkItems());
+    for (auto expand_set = queue.Pop(); !expand_set.first.empty(); expand_set = queue.Pop()) {
+      auto& [work_items, selected_splits] = expand_set;
       partition(work_items, selected_splits);
-      queue.Push(work_items, h_splits);
+      evaluate_and_enqueue(queue.ApplySplits(work_items, h_splits));
     }
     auto tree = queue.GetTree();
     this->SetLeafPredictions(tree, queue.GetInstanceRanges(), root_weight);
