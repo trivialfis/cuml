@@ -45,6 +45,7 @@
 #include <deque>
 #include <numeric>
 #include <random>
+#include <type_traits>
 #include <vector>
 
 namespace ML {
@@ -447,7 +448,7 @@ class RandomForest {
   {
     raft::common::nvtx::range fun_scope("RandomForest::fit @randomforest.cuh");
     ASSERT(n_outputs >= 1, "n_outputs must be at least 1");
-    ASSERT(rf_type != RF_type::REGRESSION || n_outputs == 1,
+    ASSERT(std::is_integral_v<L> || n_outputs == 1,
            "Multi-target regression is not yet supported by the training backend");
     const raft::handle_t& handle = user_handle;
     bool distributed =

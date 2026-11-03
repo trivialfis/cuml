@@ -244,6 +244,7 @@ class RegressionObjectiveFunction {
   static constexpr int max_leaf_outputs_per_block = 1;
 
  private:
+  std::int64_t num_outputs;
   std::int64_t min_samples_leaf;
   CRITERION criterion;
   DataT min_impurity_decrease;
@@ -394,19 +395,20 @@ class RegressionObjectiveFunction {
     }
   }
 
-  HDI RegressionObjectiveFunction(std::int64_t,
+  HDI RegressionObjectiveFunction(std::int64_t num_outputs,
                                   std::int64_t min_samples_leaf,
                                   CRITERION criterion,
                                   double root_weight,
                                   DataT min_impurity_decrease = DataT{0})
-    : min_samples_leaf(min_samples_leaf),
+    : num_outputs(num_outputs),
+      min_samples_leaf(min_samples_leaf),
       criterion(criterion),
       min_impurity_decrease(min_impurity_decrease),
       root_weight(root_weight)
   {
   }
 
-  DI std::int64_t NumClasses() const { return 1; }
+  DI std::int64_t NumClasses() const { return num_outputs; }
 
   template <typename DatasetT>
   DI void IncrementHistogram(BinT* histogram,
