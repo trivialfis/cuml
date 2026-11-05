@@ -472,7 +472,7 @@ class RegressionObjectiveFunction {
     BinT* histogram, int output_begin, int, const DatasetT& dataset, std::int64_t row) const
   {
     // Targets are column-major; each block accumulates exactly one target.
-    auto label = dataset.labels[row + std::int64_t(output_begin) * dataset.n_rows];
+    auto label    = dataset.labels[row + std::int64_t(output_begin) * dataset.n_rows];
     double weight = 1.0;
     if constexpr (weighted) {
       weight = dataset.sample_weight == nullptr ? 1.0 : double(dataset.sample_weight[row]);
