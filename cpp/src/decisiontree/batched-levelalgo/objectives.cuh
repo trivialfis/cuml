@@ -161,6 +161,22 @@ class ClassificationObjectiveFunction {
 
   DI std::int64_t NumClasses() const { return nclasses; }
 
+  DI std::int64_t NumSamples(BinT const* cdf, std::int64_t n_bins) const
+  {
+    // Each row contributes to exactly one class channel.
+    return detail::CountLeft(cdf, n_bins - 1, n_bins, nclasses);
+  }
+
+  template <typename DatasetT>
+  DI void IncrementHistogram(BinT* histogram,
+                             int n_bins,
+                             int bin,
+                             const DatasetT& dataset,
+                             std::int64_t row) const
+  {
+    IncrementHistogram(histogram, n_bins, bin, dataset.labels[row], dataset, row);
+  }
+
   template <typename DatasetT>
   DI void IncrementHistogram(BinT* histogram,
                              int n_bins,
@@ -410,11 +426,16 @@ class RegressionObjectiveFunction {
 
   DI std::int64_t NumClasses() const { return num_outputs; }
 
+  DI std::int64_t NumSamples(BinT const* cdf, std::int64_t n_bins) const
+  {
+    // Every target channel contains the same sampled rows. Count them only once.
+    return static_cast<std::int64_t>(cdf[n_bins - 1].Count());
+  }
+
   template <typename DatasetT>
   DI void IncrementHistogram(BinT* histogram,
                              int n_bins,
                              int bin,
-                             LabelT label,
                              const DatasetT& dataset,
                              std::int64_t row) const
   {
@@ -422,16 +443,23 @@ class RegressionObjectiveFunction {
     if constexpr (weighted) {
       weight = dataset.sample_weight == nullptr ? 1.0 : double(dataset.sample_weight[row]);
     }
-    BinT::IncrementHistogram(histogram, n_bins, bin, label, weight);
+    for (std::int64_t target = 0; target < num_outputs; ++target) {
+      auto label = dataset.labels[row + target * dataset.n_rows];
+      BinT::IncrementHistogram(histogram + target * n_bins, n_bins, bin, label, weight);
+    }
   }
 
   template <bool single_tile, typename DatasetT>
   DI void IncrementLeafHistogram(
     BinT* histogram, int output_begin, int, const DatasetT& dataset, std::int64_t row) const
   {
-    // Every row contributes its label to the leaf's regression statistics.
+    // Targets are column-major; each block accumulates exactly one target.
     auto label = dataset.labels[row + std::int64_t(output_begin) * dataset.n_rows];
-    IncrementHistogram(histogram, 1, 0, label, dataset, row);
+    double weight = 1.0;
+    if constexpr (weighted) {
+      weight = dataset.sample_weight == nullptr ? 1.0 : double(dataset.sample_weight[row]);
+    }
+    BinT::IncrementHistogram(histogram, 1, 0, label, weight);
   }
 
   DI Split<DataT> Gain(BinT const* shist,
