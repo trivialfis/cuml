@@ -210,7 +210,7 @@ void fit(const raft::handle_t& user_handle,
  * @param[in] verbosity Logging verbosity.
  * @param[in] sample_weight Optional per-row sample weights.
  * @param[in] input_row_major Whether input is row-major instead of column-major.
- * @param[in] n_outputs Number of regression targets. The training backend currently supports one.
+ * @param[in] n_outputs Number of regression targets, at least one.
  */
 template <typename T, typename L>
 void fit_treelite(const raft::handle_t& user_handle,
@@ -224,5 +224,6 @@ void fit_treelite(const raft::handle_t& user_handle,
                   T* feature_importances,
                   rapids_logger::level_enum verbosity,
                   const double* sample_weight = nullptr,
-                  bool input_row_major        = false);
+                  bool input_row_major        = false,
+                  int n_outputs               = 1);
 };  // namespace CUML_EXPORT ML

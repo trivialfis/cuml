@@ -102,20 +102,25 @@ void build_treelite_forest(TreeliteModelHandle* model_handle,
   if constexpr (std::is_integral_v<L>) {
     num_outputs = std::max(num_outputs, 2);
     // Ensure that num_outputs is at least 2
-    model->task_type     = tl::TaskType::kMultiClf;
-    model->postprocessor = "identity_multiclass";
+    model->task_type         = tl::TaskType::kMultiClf;
+    model->postprocessor     = "identity_multiclass";
+    model->num_target        = 1;
+    model->num_class         = std::vector<std::int32_t>{static_cast<std::int32_t>(num_outputs)};
+    model->leaf_vector_shape = std::vector<std::int32_t>{1, static_cast<std::int32_t>(num_outputs)};
+    model->target_id         = std::vector<std::int32_t>(forest->rf_params.n_trees, 0);
+    model->class_id          = std::vector<std::int32_t>(forest->rf_params.n_trees, -1);
   } else {
-    ASSERT(num_outputs == 1, "Only one variable expected for regression problem.");
-    model->task_type     = tl::TaskType::kRegressor;
-    model->postprocessor = "identity";
+    model->task_type         = tl::TaskType::kRegressor;
+    model->postprocessor     = "identity";
+    model->num_target        = num_outputs;
+    model->num_class         = std::vector<std::int32_t>(num_outputs, 1);
+    model->leaf_vector_shape = std::vector<std::int32_t>{static_cast<std::int32_t>(num_outputs), 1};
+    // Vector leaves contribute to every target; scalar leaves retain target 0.
+    model->target_id =
+      std::vector<std::int32_t>(forest->rf_params.n_trees, num_outputs > 1 ? -1 : 0);
+    model->class_id = std::vector<std::int32_t>(forest->rf_params.n_trees, 0);
   }
 
-  model->num_target        = 1;
-  model->num_class         = std::vector<std::int32_t>{static_cast<std::int32_t>(num_outputs)};
-  model->leaf_vector_shape = std::vector<std::int32_t>{1, static_cast<std::int32_t>(num_outputs)};
-  model->target_id         = std::vector<std::int32_t>(forest->rf_params.n_trees, 0);
-  model->class_id =
-    std::vector<std::int32_t>(forest->rf_params.n_trees, (std::is_integral_v<L> ? -1 : 0));
   model->num_feature         = num_features;
   model->average_tree_output = true;
   model->base_scores         = std::vector<double>(num_outputs, 0.0);
@@ -318,8 +323,9 @@ RF_params set_rf_params(int max_depth,
  *   by default, or row-major when `input_row_major` is true. Device pointer.
  * @param[in] n_rows: number of training data samples.
  * @param[in] n_cols: number of features (i.e., columns) excluding target feature.
- * @param[in] labels: Column-major target array (n_rows, n_outputs), float or double. Device pointer.
- * @param[in] n_outputs: Number of regression targets. The training backend currently supports one.
+ * @param[in] labels: Column-major target array (n_rows, n_outputs), float or double. Device
+ * pointer.
+ * @param[in] n_outputs: Number of regression targets, at least one.
  * @param[in] rf_params: Random Forest training hyper parameter struct.
  * @param[in] verbosity: verbosity level for logging messages during execution
  * @param[in] input_row_major: whether input training data is row-major instead of the default

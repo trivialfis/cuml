@@ -1193,6 +1193,63 @@ def test_rf_regression_with_identical_labels():
     }
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("order", ["C", "F"])
+@pytest.mark.parametrize("n_targets", [1, 3])
+@pytest.mark.parametrize("max_leaves", [1, -1, 4])
+def test_rf_regression_multi_target_export(
+    dtype, order, n_targets, max_leaves
+):
+    X = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=dtype, order=order)
+    # The first vector target is constant; the others require different splits.
+    y = np.array([[1, 1, 1], [1, 1, 7], [1, 5, 1], [1, 5, 7]], dtype=dtype)
+    if n_targets == 1:
+        y = y[:, 1].copy()
+    model = curfr(
+        n_estimators=3,
+        max_depth=2,
+        max_leaves=max_leaves,
+        max_features=1.0,
+        n_bins=4,
+        bootstrap=False,
+        random_state=0,
+        n_streams=1,
+        output_type="numpy",
+    ).fit(X, y)
+
+    expected = (
+        np.broadcast_to(y.mean(axis=0), y.shape) if max_leaves == 1 else y
+    )
+    predictions = model.predict(X)
+    assert model.n_outputs_ == n_targets
+    assert predictions.shape == y.shape
+    np.testing.assert_allclose(predictions, expected, rtol=1e-6, atol=1e-6)
+
+    tl_model = model.as_treelite()
+    header = tl_model.get_header_accessor()
+    for field, values in {
+        "num_target": [n_targets],
+        "num_class": [1] * n_targets,
+        "leaf_vector_shape": [n_targets, 1],
+        "target_id": [-1 if n_targets > 1 else 0] * model.n_estimators,
+        "class_id": [0] * model.n_estimators,
+        "base_scores": [0.0] * n_targets,
+        "average_tree_output": [True],
+    }.items():
+        np.testing.assert_array_equal(header.get_field(field), values)
+
+    # Check serialization and an independent inference implementation as well.
+    restored = treelite.Model.deserialize_bytes(tl_model.serialize_bytes())
+    treelite_predictions = treelite.gtil.predict(restored, X)
+    assert treelite_predictions.shape == (len(X), n_targets, 1)
+    np.testing.assert_allclose(
+        treelite_predictions[:, :, 0],
+        expected.reshape(len(X), n_targets),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
 def test_rf_regressor_gtil_integration(tmpdir):
     X, y = make_regression(n_samples=10000, random_state=0)
     X, y = X.astype(np.float32), y.astype(np.float32)
