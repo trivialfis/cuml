@@ -487,17 +487,20 @@ class RegressionObjectiveFunction {
                        std::int64_t n_bins) const
   {
     Split<DataT> sp;
+    // All regression targets contain the same rows and weights. Use one target's
+    // node weight, without summing it across targets.
     auto weight_fraction = shist[n_bins - 1].Weight() / root_weight;
     for (std::int64_t i = threadIdx.x; i < n_bins; i += blockDim.x) {
       auto nLeft  = detail::CountLeft(shist, i, n_bins, std::int64_t{1});
       auto nRight = len - nLeft;
       if (nLeft >= static_cast<std::int64_t>(min_samples_leaf) &&
           nRight >= static_cast<std::int64_t>(min_samples_leaf)) {
-        auto gain = GainPerSplit(shist, i, n_bins, len, nLeft, nRight);
-        // Use weighted gain for the threshold; store local gain.
-        auto weighted_impurity_decrease = gain * weight_fraction;
+        auto average_gain = GainPerSplit(shist, i, n_bins, len, nLeft, nRight);
+        // Compare/store the average local gain. Its whole-tree contribution is
+        // used both by the impurity threshold and by greedy node scheduling.
+        auto weighted_impurity_decrease = double(average_gain) * weight_fraction;
         if (weighted_impurity_decrease > min_impurity_decrease) {
-          sp.update(squantiles[i], col, gain, weighted_impurity_decrease, nLeft, i);
+          sp.update(squantiles[i], col, average_gain, weighted_impurity_decrease, nLeft, i);
         }
       }
     }
