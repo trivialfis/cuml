@@ -401,14 +401,32 @@ class RegressionObjectiveFunction {
         nRight < static_cast<std::int64_t>(min_samples_leaf))
       return -std::numeric_limits<DataT>::max();
 
-    switch (criterion) {
-      case CRITERION::MSE: return MSEGain(hist, i, n_bins, len, nLeft, nRight);
-      case CRITERION::POISSON: return PoissonGain(hist, i, n_bins, len, nLeft, nRight);
-      case CRITERION::GAMMA: return GammaGain(hist, i, n_bins, len, nLeft, nRight);
-      case CRITERION::INVERSE_GAUSSIAN:
-        return InverseGaussianGain(hist, i, n_bins, len, nLeft, nRight);
-      default: return -std::numeric_limits<DataT>::max();
+    // Each target has its own contiguous CDF histogram. Average the gains so
+    // duplicating targets does not change the impurity-decrease threshold.
+    double total_gain = 0.0;
+    for (std::int64_t target = 0; target < num_outputs; ++target) {
+      auto const* target_hist = hist + target * n_bins;
+      DataT target_gain;
+      switch (criterion) {
+        case CRITERION::MSE:
+          target_gain = MSEGain(target_hist, i, n_bins, len, nLeft, nRight);
+          break;
+        case CRITERION::POISSON:
+          target_gain = PoissonGain(target_hist, i, n_bins, len, nLeft, nRight);
+          break;
+        case CRITERION::GAMMA:
+          target_gain = GammaGain(target_hist, i, n_bins, len, nLeft, nRight);
+          break;
+        case CRITERION::INVERSE_GAUSSIAN:
+          target_gain = InverseGaussianGain(target_hist, i, n_bins, len, nLeft, nRight);
+          break;
+        default: return -std::numeric_limits<DataT>::max();
+      }
+      // An invalid target invalidates the whole split; never average the sentinel.
+      if (target_gain == -std::numeric_limits<DataT>::max()) { return target_gain; }
+      total_gain += target_gain;
     }
+    return DataT(total_gain / num_outputs);
   }
 
   HDI RegressionObjectiveFunction(std::int64_t num_outputs,
