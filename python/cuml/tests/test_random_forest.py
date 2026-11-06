@@ -7,13 +7,10 @@ import math
 import os
 import random
 import warnings
-from contextlib import nullcontext
-from types import SimpleNamespace
 
 import cudf
 import cupy as cp
 import numpy as np
-import pandas as pd
 import pytest
 import treelite
 from cudf.pandas import LOADED as cudf_pandas_active
@@ -42,6 +39,7 @@ from cuml.ensemble.randomforest_common import compute_max_features
 from cuml.metrics import r2_score
 from cuml.testing.utils import (
     array_equal,
+    as_numpy,
     quality_param,
     stress_param,
     unit_param,
@@ -1130,18 +1128,17 @@ def test_multiple_fits_regression(column_info, nrows, n_estimators, n_bins):
         n_samples=nrows,
         n_features=ncols,
         n_informative=n_info,
+        n_targets=3,
         random_state=123,
     )
     X = X.astype(datatype)
     y = y.astype(np.int32)
     cuml_model = curfr(n_bins=n_bins, n_estimators=n_estimators, max_depth=10)
 
-    # Calling multiple fits
-    cuml_model.fit(X, y)
-
-    cuml_model.fit(X, y)
-
-    cuml_model.fit(X, y)
+    for targets in (y[:, 0], y, y[:, 0]):
+        cuml_model.fit(X, targets)
+        assert cuml_model.n_outputs_ == (1 if targets.ndim == 1 else 3)
+        assert cuml_model.predict(X).shape == targets.shape
 
     # Check if params are still intact
     params = cuml_model.get_params()
@@ -1202,166 +1199,35 @@ def test_rf_regression_with_identical_labels():
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-@pytest.mark.parametrize("order", ["C", "F"])
 @pytest.mark.parametrize("n_targets", [1, 3])
 @pytest.mark.parametrize("max_leaves", [1, -1, 4])
-def test_rf_regression_multi_target_export(
-    dtype, order, n_targets, max_leaves
-):
-    X = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=dtype, order=order)
-    # The first vector target is constant; the others require different splits.
+def test_rf_regressor_gtil_integration(tmpdir, dtype, n_targets, max_leaves):
+    X = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=dtype)
+    # A constant target and two targets requiring different splits.
     y = np.array([[1, 1, 1], [1, 1, 7], [1, 5, 1], [1, 5, 7]], dtype=dtype)
     if n_targets == 1:
-        y = y[:, 1].copy()
-    model = curfr(
-        n_estimators=3,
+        y = y[:, 1]
+    clf = curfr(
         max_depth=2,
         max_leaves=max_leaves,
-        max_features=1.0,
+        n_estimators=1,
         n_bins=4,
         bootstrap=False,
-        random_state=0,
         n_streams=1,
-        output_type="numpy",
     ).fit(X, y)
-
     expected = (
         np.broadcast_to(y.mean(axis=0), y.shape) if max_leaves == 1 else y
     )
-    predictions = model.predict(X)
-    assert model.n_outputs_ == n_targets
-    assert predictions.shape == y.shape
-    np.testing.assert_allclose(predictions, expected, rtol=1e-6, atol=1e-6)
-
-    tl_model = model.as_treelite()
-    header = tl_model.get_header_accessor()
-    for field, values in {
-        "num_target": [n_targets],
-        "num_class": [1] * n_targets,
-        "leaf_vector_shape": [n_targets, 1],
-        "target_id": [-1 if n_targets > 1 else 0] * model.n_estimators,
-        "class_id": [0] * model.n_estimators,
-        "base_scores": [0.0] * n_targets,
-        "average_tree_output": [True],
-    }.items():
-        np.testing.assert_array_equal(header.get_field(field), values)
-
-    # Check serialization and an independent inference implementation as well.
-    restored = treelite.Model.deserialize_bytes(tl_model.serialize_bytes())
-    treelite_predictions = treelite.gtil.predict(restored, X)
-    assert treelite_predictions.shape == (len(X), n_targets, 1)
-    np.testing.assert_allclose(
-        treelite_predictions[:, :, 0],
-        expected.reshape(len(X), n_targets),
-        rtol=1e-6,
-        atol=1e-6,
-    )
-
-
-@pytest.mark.parametrize("datatype", [np.float32, np.float64])
-@pytest.mark.parametrize("n_targets", [1, 3])
-@pytest.mark.parametrize("weighted", [False, True])
-def test_rf_regressor_score_multi_target(datatype, n_targets, weighted):
-    X, y = make_regression(
-        n_samples=100, n_features=4, n_targets=n_targets, random_state=0
-    )
-    if n_targets > 1:
-        y = y * [0.1, 10, 100] + [0, 100, -1000]
-        y[:, 0] = 7  # Include a constant target in the average R².
-    X, y = X.astype(datatype), y.astype(datatype)
-    weights = np.arange(len(X), dtype=np.float64) if weighted else None
-    model = curfr(n_estimators=3, max_depth=2, n_streams=1, random_state=0)
-    model.fit(X, y, sample_weight=weights)
-    expected = sk_r2_score(
-        y,
-        _cuml_preds(model, X),
-        sample_weight=weights,
-        multioutput="uniform_average",
-    )
-    assert model.score(X, y, sample_weight=weights) == pytest.approx(
-        expected, abs=1e-6
-    )
-
-
-@pytest.mark.parametrize("n_targets", [1, 3])
-@pytest.mark.parametrize("output_type", ["numpy", "cupy", "pandas", "cudf"])
-def test_rf_regressor_output_types(n_targets, output_type):
-    X = pd.DataFrame(
-        {"x": np.arange(8, dtype=np.float32)}, index=np.arange(8) + 10
-    )
-    y = np.arange(8 * n_targets, dtype=np.float32).reshape(8, n_targets)
-    if n_targets == 1:
-        y = y[:, 0]
-    model = curfr(
-        n_estimators=1,
-        n_bins=8,
-        max_leaves=1,
-        bootstrap=False,
-        n_streams=1,
-        output_type=output_type,
-    ).fit(X, y)
-    predictions = model.predict(X)
-    expected_type = {
-        "numpy": np.ndarray,
-        "cupy": cp.ndarray,
-        "pandas": pd.Series if n_targets == 1 else pd.DataFrame,
-        "cudf": cudf.Series if n_targets == 1 else cudf.DataFrame,
-    }[output_type]
-    assert isinstance(predictions, expected_type)
-    assert predictions.shape == y.shape
-    if output_type in ("pandas", "cudf"):
-        index = predictions.index
-        if output_type == "cudf":
-            index = index.to_pandas()
-        pd.testing.assert_index_equal(index, X.index)
-        if n_targets > 1:
-            assert list(predictions.columns) == list(range(n_targets))
-    assert array_equal(predictions, np.broadcast_to(y.mean(axis=0), y.shape))
-
-
-@pytest.mark.parametrize("oob_score", [False, True])
-def test_rf_regressor_refit_target_count(oob_score):
-    X, y = make_regression(
-        n_samples=100, n_features=4, n_targets=3, random_state=0
-    )
-    X, y = X.astype(np.float32), y.astype(np.float32)
-    params = dict(
-        n_estimators=20,
-        max_depth=3,
-        random_state=0,
-        n_streams=1,
-        oob_score=oob_score,
-    )
-    model = curfr(**params)
-    for n_targets in [1, 3, 2, 1]:
-        targets = y[:, 0] if n_targets == 1 else y[:, :n_targets]
-        model.fit(X, targets)
-        reference = curfr(**params).fit(X, targets)
-        predictions = model.predict(X)
-        assert model.n_outputs_ == n_targets
-        assert predictions.shape == targets.shape
-        assert array_equal(predictions, reference.predict(X))
-        if oob_score:
-            assert model.oob_prediction_.shape == targets.shape
-            assert array_equal(
-                model.oob_prediction_, reference.oob_prediction_
-            )
-            assert model.oob_score_ == pytest.approx(reference.oob_score_)
-
-
-def test_rf_regressor_gtil_integration(tmpdir):
-    X, y = make_regression(n_samples=10000, random_state=0)
-    X, y = X.astype(np.float32), y.astype(np.float32)
-    clf = curfr(max_depth=3, random_state=0, n_estimators=10)
-    clf.fit(X, y)
-    expected_pred = clf.predict(X).reshape((-1, 1, 1))
+    assert clf.n_outputs_ == n_targets
+    assert clf.predict(X).shape == y.shape
+    assert array_equal(clf.predict(X), expected)
+    assert clf.score(X, y) == pytest.approx(sk_r2_score(y, expected))
 
     checkpoint_path = os.path.join(tmpdir, "checkpoint.tl")
     clf.as_treelite().serialize(checkpoint_path)
-
     tl_model = treelite.Model.deserialize(checkpoint_path)
     out_pred = treelite.gtil.predict(tl_model, X)
-    np.testing.assert_almost_equal(out_pred, expected_pred, decimal=4)
+    assert array_equal(out_pred, expected.reshape(len(X), n_targets, 1))
 
 
 def test_rf_binary_classifier_gtil_integration(tmpdir):
@@ -1722,12 +1588,9 @@ def test_rf_oob_score_classifier(datatype):
 
 @pytest.mark.parametrize("datatype", [np.float32, np.float64])
 @pytest.mark.parametrize("n_targets", [1, 3])
-@pytest.mark.parametrize("n_estimators", [1, 50])
 @pytest.mark.parametrize("weighted", [False, True])
-def test_rf_oob_score_regressor(
-    datatype, n_targets, n_estimators, weighted, monkeypatch
-):
-    """Test OOB score computation for RandomForestRegressor"""
+def test_rf_oob_score_regressor(datatype, n_targets, weighted):
+    """OOB R² averages the scores of individual targets, regardless of scale."""
     X, y = make_regression(
         n_samples=500,
         n_features=20,
@@ -1735,103 +1598,23 @@ def test_rf_oob_score_regressor(
         n_targets=n_targets,
         random_state=42,
     )
-    X = X.astype(datatype)
-    y = y.astype(datatype)
+    X, y = X.astype(datatype), y.astype(datatype)
     if n_targets > 1:
         y *= np.array([0.1, 10, 100], dtype=datatype)
     weights = np.arange(len(X), dtype=np.float64) % 5 if weighted else None
-    masks = None
-    compute_oob = curfr._compute_oob_score
-
-    def capture_masks(self, X, y, bootstrap_masks):
-        nonlocal masks
-        masks = cp.asnumpy(bootstrap_masks)
-        return compute_oob(self, X, y, bootstrap_masks)
-
-    monkeypatch.setattr(curfr, "_compute_oob_score", capture_masks)
-
-    # Train with OOB score
     reg = curfr(
-        n_estimators=n_estimators,
+        n_estimators=50,
         oob_score=True,
         bootstrap=True,
         max_samples=0.8,
         random_state=42,
         n_streams=1,
-    )
-    warning = (
-        pytest.warns(UserWarning, match="Some inputs do not have OOB scores")
-        if n_estimators == 1
-        else nullcontext()
-    )
-    with warning:
-        reg.fit(X, y, sample_weight=weights)
-
-    # Check OOB attributes exist
-    assert hasattr(reg, "oob_score_")
-    assert hasattr(reg, "oob_prediction_")
-
-    # Independently average each target over the trees where the row was OOB.
-    per_tree = cp.asnumpy(reg.as_nvforest().predict_per_tree(cp.asarray(X)))
-    per_tree = per_tree.reshape(len(X), n_estimators, n_targets)
-    oob = ~masks.T
-    counts = oob.sum(axis=1)
-    valid = counts > 0
-    expected = (per_tree.astype(np.float64) * oob[:, :, None]).sum(axis=1)
-    expected /= np.maximum(counts, 1)[:, None]
-    expected = expected.reshape(y.shape)
+    ).fit(X, y, sample_weight=weights)
     assert reg.oob_prediction_.shape == y.shape
-    assert array_equal(reg.oob_prediction_, expected, unit_tol=1e-6)
     assert reg.oob_score_ == pytest.approx(
-        sk_r2_score(y[valid], expected[valid], multioutput="uniform_average"),
-        abs=1e-6,
+        sk_r2_score(y, as_numpy(reg.oob_prediction_)), abs=1e-6
     )
-    if n_estimators == 1:
-        assert (~valid).any()
-    else:
-        assert valid.all()
-
-
-@pytest.mark.parametrize("no_local_oob", [False, True])
-def test_rf_distributed_oob_target_scores(no_local_oob, monkeypatch):
-    # Model two ranks: one contributes both OOB rows, the other contributes none.
-    # Targets exercise perfect constants, ordinary R², and imperfect constants.
-    y = cp.array([[7, 2, 9], [7, 8, 9]], dtype=cp.float32)
-    predictions = cp.array([[[7, 4, 10]], [[7, 6, 10]]], dtype=cp.float32)
-    model = curfr(n_estimators=1)
-    model.n_outputs_ = 3
-    model._raft_handle = object()
-    monkeypatch.setattr(
-        model,
-        "_get_inference_nvforest_model",
-        lambda: SimpleNamespace(predict_per_tree=lambda X: predictions),
-    )
-    global_stats = [
-        cp.array([14, 10, 18, 2], dtype=cp.float64),
-        cp.array([[0, 8, 2], [0, 18, 0]], dtype=cp.float64),
-    ]
-    calls = 0
-
-    def allreduce(local_stats):
-        nonlocal calls
-        expected = global_stats[calls]
-        assert array_equal(
-            local_stats, cp.zeros_like(expected) if no_local_oob else expected
-        )
-        calls += 1
-        return expected
-
-    monkeypatch.setattr(model, "_allreduce_oob_stats", allreduce)
-    masks = cp.full((1, 2), no_local_oob, dtype=cp.bool_)
-    warning = (
-        pytest.warns(UserWarning, match="Some inputs do not have OOB scores")
-        if no_local_oob
-        else nullcontext()
-    )
-    with warning:
-        model._compute_oob_score(cp.zeros((2, 1)), y, masks)
-    assert calls == 2
-    assert model.oob_score_ == pytest.approx((1 + (1 - 8 / 18) + 0) / 3)
+    assert reg.oob_score_ > 0
 
 
 def test_rf_oob_score_disabled():

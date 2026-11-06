@@ -54,41 +54,6 @@ def _get_rank_local_oob_prediction(model):
     return as_numpy(model.oob_prediction_)
 
 
-@pytest.mark.parametrize("n_targets", [1, 3])
-@pytest.mark.parametrize("input_type", ["cupy", "cudf"])
-@pytest.mark.parametrize("delayed", [False, True])
-def test_rf_regression_prediction_shape(
-    client, n_targets, input_type, delayed
-):
-    X = cp.arange(120, dtype=cp.float32).reshape(40, 3)
-    y = X[:, 0] if n_targets == 1 else X
-    if input_type == "cupy":
-        X_dask, y_dask = [from_array(a, chunks=10) for a in (X, y)]
-    else:
-        X_dask = dask_cudf.from_cudf(cudf.DataFrame(X), npartitions=4)
-        targets = cudf.Series(y) if n_targets == 1 else cudf.DataFrame(y)
-        y_dask = dask_cudf.from_cudf(targets, npartitions=4)
-    X_dask, y_dask = dask_utils.persist_across_workers(
-        client, [X_dask, y_dask]
-    )
-    model = cuRFR_mg(
-        client=client,
-        n_estimators=2,
-        max_depth=2,
-        n_bins=8,
-        bootstrap=False,
-    ).fit(X_dask, y_dask)
-    predictions = model.predict(X_dask, delayed=delayed)
-    assert predictions.ndim == y.ndim
-    assert predictions._meta.ndim == y.ndim
-    if input_type == "cupy" and n_targets > 1:
-        assert predictions.shape[1] == n_targets
-        assert predictions.chunks[1] == (n_targets,)
-    actual = predictions.compute()
-    assert actual.shape == y.shape
-    assert array_equal(actual, model.get_combined_model().predict(X))
-
-
 @pytest.mark.parametrize("partitions_per_worker", [3])
 def test_rf_classification_multi_class(partitions_per_worker, cluster):
     # Use CUDA_VISIBLE_DEVICES to control the number of workers
@@ -150,7 +115,11 @@ def test_rf_classification_multi_class(partitions_per_worker, cluster):
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
 @pytest.mark.parametrize("partitions_per_worker", [5])
-def test_rf_regression_dask_nvforest(partitions_per_worker, dtype, client):
+@pytest.mark.parametrize("n_targets", [1, 3])
+@pytest.mark.parametrize("input_type", ["cupy", "cudf"])
+def test_rf_regression_dask_nvforest(
+    partitions_per_worker, dtype, client, n_targets, input_type
+):
     n_workers = len(client.scheduler_info(n_workers=-1)["workers"])
 
     # Use CUDA_VISIBLE_DEVICES to control the number of workers
@@ -158,6 +127,7 @@ def test_rf_regression_dask_nvforest(partitions_per_worker, dtype, client):
         n_samples=n_workers * 4000,
         n_features=20,
         n_informative=10,
+        n_targets=n_targets,
         random_state=123,
     )
 
@@ -177,23 +147,39 @@ def test_rf_regression_dask_nvforest(partitions_per_worker, dtype, client):
     workers = client.has_what().keys()
     n_partitions = partitions_per_worker * len(workers)
 
-    X_cudf = cudf.DataFrame(pd.DataFrame(X_train))
-    X_train_df = dask_cudf.from_cudf(X_cudf, npartitions=n_partitions)
-
-    y_cudf = cudf.Series(y_train)
-    y_train_df = dask_cudf.from_cudf(y_cudf, npartitions=n_partitions)
-    X_cudf_test = cudf.DataFrame(pd.DataFrame(X_test))
-    X_test_df = dask_cudf.from_cudf(X_cudf_test, npartitions=n_partitions)
+    if input_type == "cudf":
+        X_train_df = dask_cudf.from_cudf(
+            cudf.DataFrame(X_train), npartitions=n_partitions
+        )
+        targets = (
+            cudf.Series(y_train) if n_targets == 1 else cudf.DataFrame(y_train)
+        )
+        y_train_df = dask_cudf.from_cudf(targets, npartitions=n_partitions)
+        X_test_df = dask_cudf.from_cudf(
+            cudf.DataFrame(X_test), npartitions=n_partitions
+        )
+    else:
+        chunks = len(X_train) // n_partitions
+        X_train_df, y_train_df, X_test_df = [
+            from_array(cp.asarray(a), chunks=(chunks,) + a.shape[1:])
+            for a in (X_train, y_train, X_test)
+        ]
 
     cuml_mod = cuRFR_mg(**cu_rf_params)
     cuml_mod.fit(X_train_df, y_train_df)
 
-    cuml_mod_predict = cuml_mod.predict(X_test_df)
-    cuml_mod_predict = cp.asnumpy(cp.array(cuml_mod_predict.compute()))
-
-    acc_score = r2_score(y_test, cuml_mod_predict)
-
-    assert acc_score >= 0.59
+    for delayed in (False, True):
+        predictions = cuml_mod.predict(X_test_df, delayed=delayed)
+        assert predictions.ndim == predictions._meta.ndim == y_test.ndim
+        if input_type == "cupy" and n_targets > 1:
+            assert predictions.shape[1] == n_targets
+            assert predictions.chunks[1] == (n_targets,)
+        actual = predictions.compute()
+        assert actual.shape == y_test.shape
+        assert array_equal(
+            actual, cuml_mod.get_combined_model().predict(X_test)
+        )
+        assert r2_score(y_test, as_numpy(actual)) >= 0.59
 
 
 def test_rf_regression_nan_on_one_worker(client):

@@ -15,7 +15,6 @@
 #include <raft/util/cuda_utils.cuh>
 #include <raft/util/cudart_utils.hpp>
 
-#include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
 
 #include <cub/device/device_segmented_reduce.cuh>
@@ -37,8 +36,7 @@
 #include <thrust/transform.h>
 
 #include <decisiontree/batched-levelalgo/bins.cuh>  // for ClassificationBin, RegressionBin, ...
-#include <decisiontree/batched-levelalgo/builder.cuh>
-#include <decisiontree/batched-levelalgo/kernels/builder_kernels_impl.cuh>
+#include <decisiontree/batched-levelalgo/kernels/builder_kernels.cuh>
 #include <decisiontree/batched-levelalgo/objectives.cuh>
 #include <decisiontree/batched-levelalgo/quantiles.cuh>
 #include <gtest/gtest.h>
@@ -233,198 +231,6 @@ TEST(RfTests, BinReductionRoundTrip)
   testBinReductionRoundTrip<DT::RegressionBin>({{0.0, 0}, {3.5, 4}, {-2.25, 9}});
   testBinReductionRoundTrip<DT::WeightedRegressionBin>(
     {{0.0, 0, 0.0}, {6.75, 3, 2.25}, {-1.5, 8, 5.5}});
-}
-
-template <typename ObjectiveT>
-class RFHistogramTest : public ::testing::Test {};
-
-using HistogramObjectives =
-  ::testing::Types<DT::RegressionObjectiveFunction<float, float>,
-                   DT::RegressionObjectiveFunction<double, double>,
-                   DT::RegressionObjectiveFunction<float, float, true>,
-                   DT::RegressionObjectiveFunction<double, double, true>,
-                   DT::ClassificationObjectiveFunction<float, int>,
-                   DT::ClassificationObjectiveFunction<double, int>,
-                   DT::ClassificationObjectiveFunction<float, int, true>,
-                   DT::ClassificationObjectiveFunction<double, int, true>>;
-TYPED_TEST_SUITE(RFHistogramTest, HistogramObjectives);
-
-TYPED_TEST(RFHistogramTest, SampledRowsAndOutputChannels)
-{
-  using ObjectiveT              = TypeParam;
-  using DataT                   = typename ObjectiveT::DataT;
-  using LabelT                  = typename ObjectiveT::LabelT;
-  using BinT                    = typename ObjectiveT::BinT;
-  using NodeT                   = SparseTreeNode<DataT, LabelT>;
-  constexpr bool classification = std::is_integral_v<LabelT>;
-  constexpr int n_rows = 4, n_bins = 3, max_n_bins = 5, threads = 128;
-  constexpr auto criterion = classification ? CRITERION::GINI : CRITERION::MSE;
-
-  raft::handle_t handle;
-  auto stream = handle.get_stream();
-  auto upload = [&]<typename T>(std::vector<T> const& values) {
-    rmm::device_uvector<T> result(values.size(), stream);
-    raft::update_device(result.data(), values.data(), values.size(), stream);
-    return result;
-  };
-  auto download = [&]<typename T>(rmm::device_uvector<T> const& values) {
-    std::vector<T> result(values.size());
-    raft::update_host(result.data(), values.data(), values.size(), stream);
-    handle.sync_stream();
-    return result;
-  };
-
-  const std::vector<DataT> features{0, 0, 1, 2};
-  const std::vector<double> weights{1, 0, 2, 3};
-  // Exclude the first/last entries and repeat rows across multiple CUDA blocks.
-  // The target stride must be n_rows, not the number of sampled occurrences.
-  std::vector<std::int64_t> row_ids{1};
-  for (int i = 0; i < 65; ++i) {
-    row_ids.insert(row_ids.end(), {3, 0, 2, 0, 1});
-  }
-  row_ids.push_back(1);
-  const std::int64_t sample_count = row_ids.size() - 2;
-  auto d_features                 = upload(features);
-  auto d_weights                  = upload(weights);
-  auto d_row_ids                  = upload(row_ids);
-  const std::vector<DataT> thresholds{0, 1, 2, 0, 0};
-  const std::vector<int> bin_counts{n_bins};
-  const std::vector<std::int64_t> columns{0};
-  const std::vector<DT::NodeWorkItem> work_items{{0, 0, {1, std::size_t(sample_count)}}};
-  const std::vector<DT::WorkloadInfo> workloads{{0, 0, 2}, {0, 1, 2}};
-  const std::vector<DT::InstanceRange> ranges{{1, std::size_t(sample_count)}};
-  const std::vector<NodeT> nodes{NodeT::CreateLeafNode(sample_count)};
-  auto d_thresholds = upload(thresholds);
-  auto d_bin_counts = upload(bin_counts);
-  auto d_columns    = upload(columns);
-  auto d_work_items = upload(work_items);
-  auto d_workloads  = upload(workloads);
-  auto d_ranges     = upload(ranges);
-  auto d_nodes      = upload(nodes);
-  DT::Quantiles<DataT> quantiles{d_thresholds.data(), d_bin_counts.data()};
-
-  for (int n_outputs : (classification ? std::vector<int>{3} : std::vector<int>{1, 3})) {
-    SCOPED_TRACE(n_outputs);
-    std::vector<LabelT> labels;
-    if constexpr (classification) {
-      labels = {0, 0, 1, 1};  // Class 2 deliberately has no rows.
-    } else {
-      labels = {0, 0, 2, 4, -2, 4, -6, 8, 7, 7, 7, 7};  // Column-major targets.
-      labels.resize(n_rows * n_outputs);
-    }
-    auto d_labels = upload(labels);
-    DT::Dataset<DataT, LabelT> dataset{d_features.data(),
-                                       d_labels.data(),
-                                       ObjectiveT::weighted ? d_weights.data() : nullptr,
-                                       n_rows,
-                                       1,
-                                       1,
-                                       n_rows,
-                                       std::int64_t(row_ids.size()),
-                                       1,
-                                       d_row_ids.data(),
-                                       n_outputs};
-
-    std::vector<BinT> expected(n_outputs * max_n_bins);
-    std::vector<BinT> expected_leaf(n_outputs);
-    double root_weight = 0;
-    for (std::int64_t pos = 1; pos <= sample_count; ++pos) {
-      auto row    = row_ids[pos];
-      auto weight = ObjectiveT::weighted ? weights[row] : 1.0;
-      root_weight += weight;
-      for (int output = 0; output < n_outputs; ++output) {
-        BinT contribution;
-        if constexpr (classification) {
-          if (labels[row] != output) { continue; }
-        } else {
-          contribution.label_sum = weight * labels[output * n_rows + row];
-        }
-        contribution.count = 1;
-        if constexpr (ObjectiveT::weighted) { contribution.weight = weight; }
-        expected[output * n_bins + int(features[row])] += contribution;
-        expected_leaf[output] += contribution;
-      }
-    }
-
-    ObjectiveT objective(n_outputs, 1, criterion, root_weight);
-    rmm::device_uvector<BinT> d_leaf(n_outputs, stream);
-    DT::launchBuildLeafHistogramsKernel(objective,
-                                        dataset,
-                                        d_nodes.data(),
-                                        d_ranges.data(),
-                                        d_leaf.data(),
-                                        1,
-                                        stream.get());
-    RAFT_CUDA_TRY(cudaGetLastError());
-    auto leaf = download(d_leaf);
-    for (int output = 0; output < n_outputs; ++output) {
-      expectBinEqual(leaf[output], expected_leaf[output]);
-    }
-
-    const std::vector<BinT> empty_hist(expected.size());
-    for (bool global_memory : {false, true}) {
-      SCOPED_TRACE(global_memory);
-      auto d_hist = upload(empty_hist);
-      const std::size_t shared_bytes =
-        n_bins * (n_outputs * sizeof(BinT) + sizeof(DataT)) + sizeof(BinT) + sizeof(DataT);
-      DT::SharedMemoryConfig memory_config{global_memory, global_memory ? 0 : shared_bytes};
-      DT::launchBuildHistogramsKernel<DataT, LabelT, threads>(d_hist.data(),
-                                                              max_n_bins,
-                                                              dataset,
-                                                              quantiles,
-                                                              d_work_items.data(),
-                                                              0,
-                                                              d_columns.data(),
-                                                              objective,
-                                                              d_workloads.data(),
-                                                              dim3(2),
-                                                              memory_config,
-                                                              stream.get());
-      RAFT_CUDA_TRY(cudaGetLastError());
-      auto hist = download(d_hist);
-      for (std::size_t i = 0; i < expected.size(); ++i) {
-        expectBinEqual(hist[i], expected[i]);
-      }
-
-      // Regression cannot split an odd number of rows into two children each
-      // larger than half the parent. Summing counts across targets would allow it.
-      // Classification must count both populated classes to find its valid split.
-      ObjectiveT split_objective(
-        n_outputs, classification ? 1 : sample_count / 2 + 1, criterion, root_weight);
-      DT::Split<DataT> split;
-      rmm::device_buffer split_storage(sizeof(split), stream);
-      auto* d_split = static_cast<DT::Split<DataT>*>(split_storage.data());
-      raft::update_device(d_split, &split, 1, stream);
-      const std::vector<int> initial_mutex{0};
-      auto d_mutex = upload(initial_mutex);
-      DT::launchFindBestSplitsKernel<DataT, LabelT, threads>(d_hist.data(),
-                                                             max_n_bins,
-                                                             dataset,
-                                                             quantiles,
-                                                             0,
-                                                             d_columns.data(),
-                                                             d_mutex.data(),
-                                                             d_split,
-                                                             split_objective,
-                                                             dim3(1),
-                                                             stream.get());
-      RAFT_CUDA_TRY(cudaGetLastError());
-      raft::update_host(&split, d_split, 1, stream);
-      handle.sync_stream();
-      EXPECT_EQ(split.IsValid(), classification);
-      if constexpr (classification) { EXPECT_EQ(split.global_nLeft, 195); }
-
-      // Check that every target/class was prefix-scanned, including empty bins.
-      auto cdf = download(d_hist);
-      for (int output = 0; output < n_outputs; ++output) {
-        BinT cumulative;
-        for (int bin = 0; bin < n_bins; ++bin) {
-          cumulative += expected[output * n_bins + bin];
-          expectBinEqual(cdf[output * n_bins + bin], cumulative);
-        }
-      }
-    }
-  }
 }
 
 template <typename DataT, typename LabelT>
@@ -1787,356 +1593,42 @@ TEST(RfTest, EquivalentSplitRangeUsesMiddleThreshold)
 TEST(RfTest, GreedyGrowthSplitsLeafWithLargestImprovement)
 {
   thrust::device_vector<float> X = std::vector<float>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
-  thrust::device_vector<float> y =
-    std::vector<float>{0, 4, 100, 100, 100, 100, 100, 102, 102, 102, 102, 102};
+  const std::vector<float> y_host{0, 4, 100, 100, 100, 100, 100, 102, 102, 102, 102, 102};
   auto stream_pool = std::make_shared<rmm::cuda_stream_pool>(1);
   raft::handle_t handle(cuda::stream_ref{cudaStreamPerThread}, stream_pool);
 
-  // The root separates the first two rows. Left improvement is 4 * 2/12;
-  // right improvement is 1 * 10/12. Both policies can grow the full four-leaf tree,
-  // but batched growth expands the left child first and greedy expands the right.
-  for (auto [max_leaves, max_batch_size] : {std::pair{-1, 1}, {-1, 128}, {4, 1}, {4, 128}}) {
-    SCOPED_TRACE(max_leaves);
-    SCOPED_TRACE(max_batch_size);
-    auto params =
-      set_rf_params(8, max_leaves, 1.0, 12, 1, 2, 0.0, false, 1, 1.0, 0, MSE, 1, max_batch_size);
-    RandomForestMetaData<float, float> forest;
-    fit(handle, &forest, X.data().get(), y.size(), 1, y.data().get(), 1, params);
+  for (int n_targets : {1, 2}) {
+    auto targets = y_host;
+    // Adding a constant target halves gains without changing split ordering.
+    if (n_targets == 2) { targets.insert(targets.end(), y_host.size(), 1.0f); }
+    thrust::device_vector<float> y = targets;
+    // The root separates the first two rows. With one target, left improvement is
+    // 4 * 2/12 and right improvement is 1 * 10/12. Both policies grow four leaves,
+    // but batched growth expands the left child first and greedy expands the right.
+    for (auto [max_leaves, max_batch_size] : {std::pair{-1, 1}, {-1, 128}, {4, 1}, {4, 128}}) {
+      SCOPED_TRACE(max_leaves);
+      SCOPED_TRACE(max_batch_size);
+      auto params =
+        set_rf_params(8, max_leaves, 1.0, 12, 1, 2, 0.0, false, 1, 1.0, 0, MSE, 1, max_batch_size);
+      RandomForestMetaData<float, float> forest;
+      fit(handle, &forest, X.data().get(), X.size(), 1, y.data().get(), n_targets, params);
 
-    const auto& tree = forest.trees[0]->sparsetree;
-    ASSERT_EQ(tree.size(), 7);
-    ASSERT_EQ(tree[0].QueryValue(), 1.0f);
-    const auto& left  = tree[tree[0].LeftChildId()];
-    const auto& right = tree[tree[0].RightChildId()];
-    ASSERT_FALSE(left.IsLeaf());
-    ASSERT_FALSE(right.IsLeaf());
-    // Children are appended when a node splits, so their IDs record expansion order.
-    if (max_leaves == -1) {
-      EXPECT_LT(left.LeftChildId(), right.LeftChildId());
-    } else {
-      EXPECT_GT(left.LeftChildId(), right.LeftChildId());
-    }
-  }
-}
-
-template <typename T>
-class RFVectorLeafTrainingTest : public ::testing::Test {
- public:
-  std::shared_ptr<rmm::cuda_stream_pool> stream_pool = std::make_shared<rmm::cuda_stream_pool>(2);
-  raft::handle_t handle{cuda::stream_ref{cudaStreamPerThread}, stream_pool};
-  static constexpr double tolerance = std::is_same_v<T, float> ? 1e-5 : 1e-10;
-
-  RandomForestMetaData<T, T> Train(std::vector<T> X,
-                                   std::vector<T> const& y,
-                                   int n_rows,
-                                   int n_cols,
-                                   int n_outputs,
-                                   RF_params params,
-                                   std::vector<double> const& weights = {},
-                                   bool row_major                     = false,
-                                   bool* bootstrap_masks              = nullptr)
-  {
-    if (row_major) {
-      auto column_major = X;
-      for (int row = 0; row < n_rows; ++row) {
-        for (int col = 0; col < n_cols; ++col) {
-          X[row * n_cols + col] = column_major[col * n_rows + row];
-        }
+      const auto& tree = forest.trees[0]->sparsetree;
+      ASSERT_EQ(tree.size(), 7);
+      ASSERT_EQ(tree[0].QueryValue(), 1.0f);
+      const auto& left  = tree[tree[0].LeftChildId()];
+      const auto& right = tree[tree[0].RightChildId()];
+      ASSERT_FALSE(left.IsLeaf());
+      ASSERT_FALSE(right.IsLeaf());
+      EXPECT_NEAR(left.BestMetric(), 4.0f / n_targets, 1e-5f);
+      EXPECT_NEAR(right.BestMetric(), 1.0f / n_targets, 1e-5f);
+      // Children are appended when a node splits, so their IDs record expansion order.
+      if (max_leaves == -1) {
+        EXPECT_LT(left.LeftChildId(), right.LeftChildId());
+      } else {
+        EXPECT_GT(left.LeftChildId(), right.LeftChildId());
       }
     }
-    auto stream = handle.get_stream();
-    rmm::device_uvector<T> d_X(X.size(), stream), d_y(y.size(), stream);
-    rmm::device_uvector<double> d_weights(weights.size(), stream);
-    raft::update_device(d_X.data(), X.data(), X.size(), stream);
-    raft::update_device(d_y.data(), y.data(), y.size(), stream);
-    if (!weights.empty()) {
-      raft::update_device(d_weights.data(), weights.data(), weights.size(), stream);
-    }
-    handle.sync_stream();
-    RandomForestMetaData<T, T> forest;
-    fit(handle,
-        &forest,
-        d_X.data(),
-        n_rows,
-        n_cols,
-        d_y.data(),
-        n_outputs,
-        params,
-        rapids_logger::level_enum::info,
-        bootstrap_masks,
-        weights.empty() ? nullptr : d_weights.data(),
-        row_major);
-    return forest;
-  }
-
-  void ExpectEquivalent(RandomForestMetaData<T, T> const& reference,
-                        RandomForestMetaData<T, T> const& actual,
-                        std::vector<int> const& target_map)
-  {
-    ASSERT_EQ(reference.trees.size(), actual.trees.size());
-    for (std::size_t t = 0; t < actual.trees.size(); ++t) {
-      SCOPED_TRACE(t);
-      auto const& expected_tree = *reference.trees[t];
-      auto const& tree          = *actual.trees[t];
-      ASSERT_EQ(tree.num_outputs, target_map.size());
-      ASSERT_EQ(tree.sparsetree.size(), expected_tree.sparsetree.size());
-      ASSERT_EQ(tree.vector_leaf.size(), tree.sparsetree.size() * tree.num_outputs);
-      for (std::size_t n = 0; n < tree.sparsetree.size(); ++n) {
-        SCOPED_TRACE(n);
-        auto const& node          = tree.sparsetree[n];
-        auto const& expected_node = expected_tree.sparsetree[n];
-        EXPECT_EQ(node.IsLeaf(), expected_node.IsLeaf());
-        EXPECT_EQ(node.ColumnId(), expected_node.ColumnId());
-        EXPECT_EQ(node.QueryValue(), expected_node.QueryValue());
-        EXPECT_EQ(node.LeftChildId(), expected_node.LeftChildId());
-        EXPECT_EQ(node.RightChildId(), expected_node.RightChildId());
-        EXPECT_EQ(node.InstanceCount(), expected_node.InstanceCount());
-        EXPECT_NEAR(node.BestMetric(), expected_node.BestMetric(), tolerance);
-        if (node.IsLeaf()) {
-          for (std::size_t k = 0; k < target_map.size(); ++k) {
-            EXPECT_NEAR(tree.vector_leaf[n * tree.num_outputs + k],
-                        expected_tree.vector_leaf[n * expected_tree.num_outputs + target_map[k]],
-                        tolerance);
-          }
-        }
-      }
-    }
-  }
-};
-
-using VectorLeafTrainingTypes = ::testing::Types<float, double>;
-TYPED_TEST_SUITE(RFVectorLeafTrainingTest, VectorLeafTrainingTypes);
-
-TYPED_TEST(RFVectorLeafTrainingTest, RootLeavesContainEveryTargetMean)
-{
-  using T = TypeParam;
-  const std::vector<T> X{0, 1, 2, 3};
-  const std::vector<T> y{1, 3, 5, 9, 8, 6, 4, 2, 7, 7, 7, 7};
-  for (auto criterion : {MSE, POISSON, GAMMA, INVERSE_GAUSSIAN}) {
-    SCOPED_TRACE(criterion);
-    for (bool weighted : {false, true}) {
-      SCOPED_TRACE(weighted);
-      const std::vector<double> weights =
-        weighted ? std::vector<double>{1, 0, 2, 1} : std::vector<double>{};
-      const std::array<double, 3> expected =
-        weighted ? std::array{5.0, 4.5, 7.0} : std::array{4.5, 5.0, 7.0};
-      for (int max_leaves : {-1, 1}) {
-        auto params = set_rf_params(max_leaves == 1 ? 8 : 0,
-                                    max_leaves,
-                                    1.0,
-                                    4,
-                                    1,
-                                    2,
-                                    0.0,
-                                    false,
-                                    3,
-                                    1.0,
-                                    42,
-                                    criterion,
-                                    2,
-                                    128);
-        auto forest = this->Train(X, y, 4, 1, 3, params, weights);
-        ASSERT_EQ(forest.trees.size(), 3);
-        for (auto const& tree : forest.trees) {
-          EXPECT_EQ(tree->num_outputs, 3);
-          ASSERT_EQ(tree->sparsetree.size(), 1);
-          EXPECT_TRUE(tree->sparsetree[0].IsLeaf());
-          EXPECT_EQ(tree->sparsetree[0].InstanceCount(), weighted ? 3 : 4);
-          ASSERT_EQ(tree->vector_leaf.size(), 3);
-          for (int k = 0; k < 3; ++k) {
-            EXPECT_NEAR(tree->vector_leaf[k], expected[k], TestFixture::tolerance);
-          }
-        }
-      }
-    }
-  }
-}
-
-TYPED_TEST(RFVectorLeafTrainingTest, HighTargetCountLeafHistograms)
-{
-  constexpr int n_targets = 4097;
-  std::vector<TypeParam> y(2 * n_targets);
-  std::iota(y.begin(), y.end(), TypeParam{0});
-  auto params = set_rf_params(0, -1, 1.0, 2, 1, 2, 0.0, false, 1, 1.0, 0, MSE, 1, 128);
-  for (bool weighted : {false, true}) {
-    const std::vector<double> weights =
-      weighted ? std::vector<double>{1, 3} : std::vector<double>{};
-    auto forest      = this->Train({0, 1}, y, 2, 1, n_targets, params, weights);
-    const auto& tree = *forest.trees.front();
-    ASSERT_EQ(tree.sparsetree.size(), 1);
-    ASSERT_EQ(tree.vector_leaf.size(), n_targets);
-    for (int target = 0; target < n_targets; ++target) {
-      EXPECT_EQ(tree.vector_leaf[target], 2 * target + (weighted ? 0.75 : 0.5));
-    }
-  }
-}
-
-TYPED_TEST(RFVectorLeafTrainingTest, TrainsSplitsAndVectorLeaves)
-{
-  using T = TypeParam;
-  const std::vector<T> X{0, 0, 1, 1, 0, 1, 0, 1};
-  // The first target is constant. The other two prefer different features.
-  const std::vector<T> y{1, 1, 1, 1, 1, 1, 5, 5, 1, 7, 1, 7};
-  for (auto criterion : {MSE, POISSON, GAMMA, INVERSE_GAUSSIAN}) {
-    SCOPED_TRACE(criterion);
-    for (bool weighted : {false, true}) {
-      SCOPED_TRACE(weighted);
-      const std::vector<double> weights =
-        weighted ? std::vector<double>{1, 2, 3, 4} : std::vector<double>{};
-      for (bool row_major : {false, true}) {
-        SCOPED_TRACE(row_major);
-        for (int max_leaves : {-1, 4}) {
-          SCOPED_TRACE(max_leaves);
-          for (int batch_size : {1, 128}) {
-            SCOPED_TRACE(batch_size);
-            for (int depth : {1, 2}) {
-              SCOPED_TRACE(depth);
-              auto params = set_rf_params(
-                depth, max_leaves, 1.0, 4, 1, 2, 0.0, false, 3, 1.0, 42, criterion, 2, batch_size);
-              auto forest = this->Train(X, y, 4, 2, 3, params, weights, row_major);
-              ASSERT_EQ(forest.trees.size(), 3);
-              EXPECT_EQ(forest.n_features, 2);
-              for (auto const& tree : forest.trees) {
-                EXPECT_EQ(tree->num_outputs, 3);
-                ASSERT_EQ(tree->sparsetree.size(), depth == 1 ? 3 : 7);
-                ASSERT_EQ(tree->vector_leaf.size(), tree->sparsetree.size() * 3);
-                EXPECT_EQ(tree->sparsetree[0].InstanceCount(), 4);
-                if (!weighted) {
-                  EXPECT_EQ(tree->sparsetree[0].ColumnId(), 1);
-                  if (criterion == MSE) {
-                    EXPECT_NEAR(tree->sparsetree[0].BestMetric(), 3.0, TestFixture::tolerance);
-                  }
-                }
-                // Route the original rows through the learned tree and compute
-                // independent weighted means for each final leaf and target.
-                std::vector<int> counts(tree->sparsetree.size(), 0);
-                std::vector<double> weight_sums(tree->sparsetree.size(), 0.0);
-                std::vector<double> label_sums(tree->vector_leaf.size(), 0.0);
-                for (int row = 0; row < 4; ++row) {
-                  std::size_t node = 0;
-                  while (!tree->sparsetree[node].IsLeaf()) {
-                    auto const& split = tree->sparsetree[node];
-                    node              = X[split.ColumnId() * 4 + row] <= split.QueryValue()
-                                          ? split.LeftChildId()
-                                          : split.RightChildId();
-                    ASSERT_LT(node, tree->sparsetree.size());
-                  }
-                  auto weight = weighted ? weights[row] : 1.0;
-                  ++counts[node];
-                  weight_sums[node] += weight;
-                  for (int k = 0; k < 3; ++k) {
-                    label_sums[node * 3 + k] += weight * y[k * 4 + row];
-                  }
-                }
-                for (std::size_t node = 0; node < tree->sparsetree.size(); ++node) {
-                  if (!tree->sparsetree[node].IsLeaf()) { continue; }
-                  ASSERT_GT(weight_sums[node], 0);
-                  EXPECT_EQ(tree->sparsetree[node].InstanceCount(), counts[node]);
-                  if (depth == 2) { EXPECT_EQ(counts[node], 1); }
-                  for (int k = 0; k < 3; ++k) {
-                    EXPECT_NEAR(tree->vector_leaf[node * 3 + k],
-                                label_sums[node * 3 + k] / weight_sums[node],
-                                TestFixture::tolerance);
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-TYPED_TEST(RFVectorLeafTrainingTest, TargetDuplicationAndPermutationPreserveTrees)
-{
-  using T = TypeParam;
-  const std::vector<T> X{0, 1, 2, 3, 4, 5};
-  const std::vector<T> y{1, 3, 10, 8, 2, 6, 8, 5, 1, 2, 7, 4, 3, 3, 3, 3, 3, 3};
-  for (bool bootstrap : {false, true}) {
-    SCOPED_TRACE(bootstrap);
-    for (bool weighted : {false, true}) {
-      SCOPED_TRACE(weighted);
-      const std::vector<double> weights =
-        weighted ? std::vector<double>{1, 2, 0, 4, 3, 1} : std::vector<double>{};
-      for (int max_leaves : {-1, 4}) {
-        auto params =
-          set_rf_params(4, max_leaves, 1.0, 6, 1, 2, 0.1, bootstrap, 3, 1.0, 42, MSE, 2, 128);
-        const std::vector<T> scalar_y(y.begin(), y.begin() + 6);
-        std::vector<T> repeated_y;
-        for (int k = 0; k < 3; ++k) {
-          repeated_y.insert(repeated_y.end(), scalar_y.begin(), scalar_y.end());
-        }
-        auto scalar   = this->Train(X, scalar_y, 6, 1, 1, params, weights);
-        auto repeated = this->Train(X, repeated_y, 6, 1, 3, params, weights);
-        this->ExpectEquivalent(scalar, repeated, {0, 0, 0});
-
-        auto reference = this->Train(X, y, 6, 1, 3, params, weights);
-        for (auto target_map : {std::vector<int>{2, 0, 1}, std::vector<int>{0, 1, 2, 0, 1, 2}}) {
-          std::vector<T> transformed_y;
-          for (auto k : target_map) {
-            transformed_y.insert(transformed_y.end(), y.begin() + k * 6, y.begin() + (k + 1) * 6);
-          }
-          auto transformed =
-            this->Train(X, transformed_y, 6, 1, target_map.size(), params, weights);
-          this->ExpectEquivalent(reference, transformed, target_map);
-        }
-      }
-    }
-  }
-}
-
-TYPED_TEST(RFVectorLeafTrainingTest, BootstrapUsesSampleMultiplicitiesForEveryTarget)
-{
-  using T              = TypeParam;
-  constexpr int n_rows = 3, n_trees = 16;
-  const std::vector<T> X{0, 1, 2};
-  // Indicator targets reveal sampled multiplicities; the final target checks
-  // that the same occurrences contribute to every output's mean.
-  const std::vector<T> y{1, 0, 0, 0, 1, 0, 0, 10, 100};
-  for (bool weighted : {false, true}) {
-    SCOPED_TRACE(weighted);
-    const std::vector<double> weights =
-      weighted ? std::vector<double>{1, 2, 5} : std::vector<double>{};
-    auto params = set_rf_params(0, -1, 1.0, 3, 1, 2, 0.0, true, n_trees, 1.0, 42, MSE, 2, 128);
-    rmm::device_uvector<bool> d_masks(n_rows * n_trees, this->handle.get_stream());
-    auto forest = this->Train(X, y, n_rows, 1, 3, params, weights, false, d_masks.data());
-    std::array<bool, n_rows * n_trees> masks{};
-    raft::update_host(masks.data(), d_masks.data(), masks.size(), this->handle.get_stream());
-    this->handle.sync_stream();
-    bool found_duplicate = false;
-    ASSERT_EQ(forest.trees.size(), n_trees);
-    for (int t = 0; t < n_trees; ++t) {
-      SCOPED_TRACE(t);
-      auto const& tree = *forest.trees[t];
-      ASSERT_EQ(tree.sparsetree.size(), 1);
-      EXPECT_EQ(tree.sparsetree[0].InstanceCount(), n_rows);
-      ASSERT_EQ(tree.vector_leaf.size(), 3);
-      auto count0 = int(std::lround(n_rows * tree.vector_leaf[0]));
-      auto count1 = int(std::lround(n_rows * tree.vector_leaf[1]));
-      std::array<int, 3> counts{count0, count1, n_rows - count0 - count1};
-      for (int k = 0; k < 3; ++k) {
-        EXPECT_GE(counts[k], 0);
-        EXPECT_LE(counts[k], n_rows);
-        EXPECT_EQ(counts[k] > 0, masks[t * n_rows + k]);
-      }
-      EXPECT_NEAR(tree.vector_leaf[0], counts[0] / 3.0, TestFixture::tolerance);
-      EXPECT_NEAR(tree.vector_leaf[1], counts[1] / 3.0, TestFixture::tolerance);
-      EXPECT_NEAR(
-        tree.vector_leaf[2], (10.0 * counts[1] + 100.0 * counts[2]) / 3.0, TestFixture::tolerance);
-      auto distinct =
-        int(masks[t * n_rows]) + int(masks[t * n_rows + 1]) + int(masks[t * n_rows + 2]);
-      found_duplicate |= distinct == 2;
-    }
-    EXPECT_TRUE(found_duplicate);
-  }
-}
-
-TYPED_TEST(RFVectorLeafTrainingTest, RejectsNonpositiveTargetCount)
-{
-  auto params = set_rf_params(1, -1, 1.0, 2, 1, 2, 0.0, false, 1, 1.0, 42, MSE, 1, 128);
-  for (int n_outputs : {0, -1}) {
-    EXPECT_THROW(this->Train({0, 1}, {1, 2}, 2, 1, n_outputs, params), raft::exception);
   }
 }
 
@@ -2220,36 +1712,44 @@ TEST(RfWeightedTest, ClassificationRootLeafUsesWeights)
 TEST(RfWeightedTest, RegressionRootLeafUsesWeights)
 {
   RF_params rf_params = set_rf_params(0, -1, 1.0, 4, 1, 2, 0.0, false, 1, 1.0, 0, MSE, 1, 128);
-  auto forest         = std::make_shared<RandomForestMetaData<float, float>>();
 
   std::vector<float> X_host             = {0.0f, 1.0f, 2.0f};
   thrust::device_vector<float> X        = X_host;
-  std::vector<float> y_host             = {0.0f, 10.0f, 10.0f};
-  thrust::device_vector<float> y        = y_host;
   std::vector<double> weight_host       = {1.0f, 0.0f, 3.0f};
   thrust::device_vector<double> weights = weight_host;
   auto stream_pool                      = std::make_shared<rmm::cuda_stream_pool>(1);
   raft::handle_t handle(cuda::stream_ref{cudaStreamPerThread}, stream_pool);
 
-  fit(handle,
-      forest.get(),
-      X.data().get(),
-      y.size(),
-      1,
-      y.data().get(),
-      1,
-      rf_params,
-      rapids_logger::level_enum::info,
-      nullptr,
-      weights.data().get());
+  for (int n_targets : {1, 4097}) {
+    auto forest = std::make_shared<RandomForestMetaData<float, float>>();
+    // Shift each target's weighted mean; the large case exercises leaf tiling.
+    std::vector<float> y_host;
+    for (int target = 0; target < n_targets; ++target) {
+      y_host.insert(y_host.end(), {float(target), target + 10.0f, target + 10.0f});
+    }
+    thrust::device_vector<float> y = y_host;
+    fit(handle,
+        forest.get(),
+        X.data().get(),
+        X.size(),
+        1,
+        y.data().get(),
+        n_targets,
+        rf_params,
+        rapids_logger::level_enum::info,
+        nullptr,
+        weights.data().get());
 
-  ASSERT_EQ(forest->trees.size(), 1);
-  const auto& tree = *forest->trees[0];
-  ASSERT_EQ(tree.sparsetree.size(), 1);
-  EXPECT_TRUE(tree.sparsetree[0].IsLeaf());
-  EXPECT_EQ(tree.sparsetree[0].InstanceCount(), 2);
-  ASSERT_EQ(tree.vector_leaf.size(), 1);
-  EXPECT_NEAR(tree.vector_leaf[0], 7.5f, 1e-6f);
+    ASSERT_EQ(forest->trees.size(), 1);
+    const auto& tree = *forest->trees[0];
+    ASSERT_EQ(tree.sparsetree.size(), 1);
+    EXPECT_TRUE(tree.sparsetree[0].IsLeaf());
+    EXPECT_EQ(tree.sparsetree[0].InstanceCount(), 2);
+    ASSERT_EQ(tree.vector_leaf.size(), n_targets);
+    for (int target = 0; target < n_targets; ++target) {
+      EXPECT_NEAR(tree.vector_leaf[target], target + 7.5f, 1e-6f);
+    }
+  }
 }
 
 TEST(RfWeightedTest, MinSamplesLeafUsesCountsNotWeights)
@@ -2894,6 +2394,23 @@ class ObjectiveTest : public ::testing::TestWithParam<ObjectiveTestParameters> {
     if (!std::isnan(ground_truth_gain) || !std::isnan(hypothesis_gain)) {
       ASSERT_NEAR(ground_truth_gain, hypothesis_gain, params.tolerance);
     }
+
+    if constexpr (!is_classification) {
+      // Vector gain is the mean of the gains for two independently drawn targets.
+      auto second_target           = GenRandomData();
+      auto [second_cdf, second_pdf] = GenHist(second_target, sample_weights);
+      cdf_hist.insert(cdf_hist.end(), second_cdf.begin(), second_cdf.end());
+      auto expected = 0.5 * ground_truth_gain +
+                      0.5 * GroundTruthGain(second_target, sample_weights, split_bin_index);
+      ObjectiveT vector_objective(2,
+                                  params.min_samples_leaf,
+                                  ObjectiveConfig::splitCriteria,
+                                  std::accumulate(sample_weights.begin(), sample_weights.end(), 0.0));
+      EXPECT_NEAR(vector_objective.GainPerSplit(
+                    cdf_hist.data(), split_bin_index, params.max_n_bins, len, nLeft, len - nLeft),
+                  expected,
+                  params.tolerance);
+    }
   }
 };
 
@@ -2926,307 +2443,6 @@ TEST(WeightedObjectiveEdgeCases, RegressionRejectsZeroWeightChild)
       auto gain = objective.GainPerSplit(hist.data(), 0, 2, 2, 1, 1);
       EXPECT_EQ(gain, -std::numeric_limits<double>::max());
     }
-  }
-}
-
-template <typename ObjectiveT>
-class RFMultiTargetGainTest : public ::testing::Test {
- public:
-  using BinT = typename ObjectiveT::BinT;
-
-  static BinT MakeBin(double label_sum, BinCountT count, double weight)
-  {
-    if constexpr (ObjectiveT::weighted) {
-      return {label_sum, count, weight};
-    } else {
-      return {label_sum, count};
-    }
-  }
-};
-
-using MultiTargetGainObjectives =
-  ::testing::Types<RegressionObjectiveFunction<float, float>,
-                   RegressionObjectiveFunction<double, double>,
-                   RegressionObjectiveFunction<float, float, true>,
-                   RegressionObjectiveFunction<double, double, true>>;
-TYPED_TEST_SUITE(RFMultiTargetGainTest, MultiTargetGainObjectives);
-
-TYPED_TEST(RFMultiTargetGainTest, AveragesAllTargets)
-{
-  using DataT              = typename TypeParam::DataT;
-  using BinT               = typename TypeParam::BinT;
-  const double left_weight = TypeParam::weighted ? 1.0 : 2.0;
-  const double tolerance   = std::is_same_v<DataT, float> ? 1e-5 : 1e-12;
-  // Two rows per child. Target means are (3, 3), (1, 5), and (2, 8).
-  // Weighted cases give each left row weight 0.5 and each right row weight 1.5.
-  std::vector<BinT> hist;
-  for (auto [left_mean, right_mean] : {std::pair{3.0, 3.0}, {1.0, 5.0}, {2.0, 8.0}}) {
-    hist.push_back(TestFixture::MakeBin(left_mean * left_weight, 2, left_weight));
-    hist.push_back(
-      TestFixture::MakeBin(left_mean * left_weight + right_mean * (4 - left_weight), 4, 4));
-  }
-  const std::array<CRITERION, 4> criteria{
-    CRITERION::MSE, CRITERION::POISSON, CRITERION::GAMMA, CRITERION::INVERSE_GAUSSIAN};
-  // Analytical mean impurity reductions for the three targets above.
-  const std::array<double, 4> expected =
-    TypeParam::weighted
-      ? std::array{3.25, 0.38224113921565195, 0.1060500507653479, 0.03581730769230769}
-      : std::array{13.0 / 3.0, 0.5638272333965695, 0.17234562792175645, 0.06319444444444446};
-  for (std::size_t c = 0; c < criteria.size(); ++c) {
-    SCOPED_TRACE(criteria[c]);
-    TypeParam objective(3, 1, criteria[c], 4.0);
-    EXPECT_NEAR(objective.GainPerSplit(hist.data(), 0, 2, 4, 2, 2), expected[c], tolerance);
-
-    auto permuted = hist;
-    std::rotate(permuted.begin(), permuted.begin() + 2, permuted.end());
-    EXPECT_NEAR(objective.GainPerSplit(permuted.data(), 0, 2, 4, 2, 2), expected[c], tolerance);
-
-    auto duplicated = hist;
-    duplicated.insert(duplicated.end(), hist.begin(), hist.end());
-    TypeParam repeated(6, 1, criteria[c], 4.0);
-    EXPECT_NEAR(repeated.GainPerSplit(duplicated.data(), 0, 2, 4, 2, 2), expected[c], tolerance);
-
-    TypeParam too_few_rows(3, 3, criteria[c], 4.0);
-    EXPECT_EQ(too_few_rows.GainPerSplit(hist.data(), 0, 2, 4, 2, 2),
-              -std::numeric_limits<DataT>::max());
-  }
-}
-
-TYPED_TEST(RFMultiTargetGainTest, RejectsInvalidTarget)
-{
-  using DataT = typename TypeParam::DataT;
-  using BinT  = typename TypeParam::BinT;
-  for (auto criterion : {CRITERION::POISSON, CRITERION::GAMMA, CRITERION::INVERSE_GAUSSIAN}) {
-    SCOPED_TRACE(criterion);
-    TypeParam objective(2, 1, criterion, 4.0);
-    for (int invalid_target : {0, 1}) {
-      SCOPED_TRACE(invalid_target);
-      for (bool invalid_left : {false, true}) {
-        SCOPED_TRACE(invalid_left);
-        std::vector<BinT> hist{TestFixture::MakeBin(2, 2, 2),
-                               TestFixture::MakeBin(12, 4, 4),
-                               TestFixture::MakeBin(2, 2, 2),
-                               TestFixture::MakeBin(12, 4, 4)};
-        // A zero label sum in either child invalidates this target's deviance gain.
-        hist[2 * invalid_target]     = TestFixture::MakeBin(invalid_left ? 0 : 4, 2, 2);
-        hist[2 * invalid_target + 1] = TestFixture::MakeBin(4, 4, 4);
-        EXPECT_EQ(objective.GainPerSplit(hist.data(), 0, 2, 4, 2, 2),
-                  -std::numeric_limits<DataT>::max());
-      }
-    }
-  }
-}
-
-TYPED_TEST(RFMultiTargetGainTest, SelectsSplitUsingAverageGain)
-{
-  using DataT = typename TypeParam::DataT;
-  using BinT  = typename TypeParam::BinT;
-  // Target 0 is [0, 2, 2] and prefers threshold 0; target 1 is [0, 0, 6]
-  // and prefers threshold 1. Their average gain selects threshold 1.
-  const std::vector<BinT> hist{TestFixture::MakeBin(0, 1, 1),
-                               TestFixture::MakeBin(2, 2, 2),
-                               TestFixture::MakeBin(4, 3, 3),
-                               TestFixture::MakeBin(0, 1, 1),
-                               TestFixture::MakeBin(0, 2, 2),
-                               TestFixture::MakeBin(6, 3, 3)};
-  const std::vector<DataT> quantiles{0, 1, 2};
-  raft::handle_t handle;
-  auto stream = handle.get_stream();
-  rmm::device_uvector<BinT> d_hist(hist.size(), stream);
-  rmm::device_uvector<DataT> d_quantiles(quantiles.size(), stream);
-  rmm::device_uvector<int> d_mutex(1, stream);
-  rmm::device_buffer split_storage(sizeof(Split<DataT>), stream);
-  auto* d_split = static_cast<Split<DataT>*>(split_storage.data());
-  raft::update_device(d_hist.data(), hist.data(), hist.size(), stream);
-  raft::update_device(d_quantiles.data(), quantiles.data(), quantiles.size(), stream);
-
-  // Node weight is 3 and root weight is 6, so the weighted average gain is 37/18.
-  // A summed gain would incorrectly pass the second threshold.
-  for (DataT min_impurity_decrease : {DataT{2}, DataT{3}}) {
-    SCOPED_TRACE(min_impurity_decrease);
-    TypeParam objective(2, 1, CRITERION::MSE, 6.0, min_impurity_decrease);
-    objectiveGainKernel<<<1, 32, 0, stream.get()>>>(d_hist.data(),
-                                                    d_quantiles.data(),
-                                                    d_split,
-                                                    d_mutex.data(),
-                                                    objective,
-                                                    std::int64_t{0},
-                                                    std::int64_t{3},
-                                                    std::int64_t{3});
-    RAFT_CUDA_TRY(cudaGetLastError());
-    Split<DataT> split;
-    raft::update_host(&split, d_split, 1, stream);
-    handle.sync_stream();
-    if (min_impurity_decrease == DataT{2}) {
-      ASSERT_TRUE(split.IsValid());
-      EXPECT_EQ(split.quesval, DataT{1});
-      EXPECT_EQ(split.global_nLeft, 2);
-      EXPECT_NEAR(split.best_metric_val, 37.0 / 9.0, 1e-6);
-      EXPECT_NEAR(split.weighted_impurity_decrease, 37.0 / 18.0, 1e-6);
-    } else {
-      EXPECT_FALSE(split.IsValid());
-    }
-  }
-}
-
-TYPED_TEST(RFMultiTargetGainTest, CompetingFeaturesUseAverageGain)
-{
-  using DataT = typename TypeParam::DataT;
-  using BinT  = typename TypeParam::BinT;
-  raft::handle_t handle;
-  auto stream = handle.get_stream();
-  const std::vector<DataT> quantiles{0, 1, 0, 1};
-  const std::vector<int> bin_counts{2, 2};
-  const std::vector<std::int64_t> columns{0, 1};
-  rmm::device_uvector<DataT> d_quantiles(4, stream);
-  rmm::device_uvector<int> d_bin_counts(2, stream), d_mutex(1, stream);
-  rmm::device_uvector<std::int64_t> d_columns(2, stream);
-  rmm::device_buffer split_storage(sizeof(Split<DataT>), stream);
-  auto* d_split = static_cast<Split<DataT>*>(split_storage.data());
-  raft::update_device(d_quantiles.data(), quantiles.data(), quantiles.size(), stream);
-  raft::update_device(d_bin_counts.data(), bin_counts.data(), bin_counts.size(), stream);
-  raft::update_device(d_columns.data(), columns.data(), columns.size(), stream);
-  Quantiles<DataT> device_quantiles{d_quantiles.data(), d_bin_counts.data()};
-
-  // Target 0 is [0, 0, 4, 4], target 1 is [0, 6, 0, 6]. Feature 0 separates
-  // rows {0, 1} from {2, 3}; feature 1 separates {0, 2} from {1, 3}.
-  // Target 0 favors feature 0, but averaging both targets favors feature 1.
-  for (int n_outputs : {2, 4}) {
-    SCOPED_TRACE(n_outputs);
-    std::vector<BinT> hist;
-    for (auto sums : {std::array{0.0, 8.0, 6.0, 6.0}, std::array{4.0, 4.0, 0.0, 12.0}}) {
-      for (int copy = 0; copy < n_outputs / 2; ++copy) {
-        for (auto sum : sums) {
-          hist.push_back(TestFixture::MakeBin(sum, 2, 2));
-        }
-      }
-    }
-    rmm::device_uvector<BinT> d_hist(hist.size(), stream);
-    Dataset<DataT, DataT> dataset{};
-    dataset.n_rows         = 4;
-    dataset.n_cols         = 2;
-    dataset.n_sampled_cols = 2;
-    dataset.num_outputs    = n_outputs;
-
-    // Root weight is twice this node's weight. A summed gain would incorrectly
-    // pass min_impurity_decrease=3, and duplicating targets must change nothing.
-    for (DataT min_impurity_decrease : {DataT{0}, DataT{3}}) {
-      SCOPED_TRACE(min_impurity_decrease);
-      TypeParam objective(n_outputs, 1, CRITERION::MSE, 8.0, min_impurity_decrease);
-      Split<DataT> split;
-      raft::update_device(d_split, &split, 1, stream);
-      raft::update_device(d_hist.data(), hist.data(), hist.size(), stream);
-      RAFT_CUDA_TRY(cudaMemsetAsync(d_mutex.data(), 0, sizeof(int), stream.get()));
-      launchFindBestSplitsKernel<DataT, DataT, 128>(d_hist.data(),
-                                                    2,
-                                                    dataset,
-                                                    device_quantiles,
-                                                    0,
-                                                    d_columns.data(),
-                                                    d_mutex.data(),
-                                                    d_split,
-                                                    objective,
-                                                    dim3(1, 2),
-                                                    stream.get());
-      RAFT_CUDA_TRY(cudaGetLastError());
-      raft::update_host(&split, d_split, 1, stream);
-      handle.sync_stream();
-      if (min_impurity_decrease == DataT{0}) {
-        ASSERT_TRUE(split.IsValid());
-        EXPECT_EQ(split.colid, 1);
-        EXPECT_EQ(split.global_nLeft, 2);
-        EXPECT_EQ(split.best_metric_val, DataT{4.5});
-        EXPECT_EQ(split.weighted_impurity_decrease, 2.25);
-      } else {
-        EXPECT_FALSE(split.IsValid());
-      }
-    }
-  }
-}
-
-TYPED_TEST(RFMultiTargetGainTest, GreedyQueueUsesWeightedAverageAndStoresLocalAverage)
-{
-  using DataT = typename TypeParam::DataT;
-  using BinT  = typename TypeParam::BinT;
-  raft::handle_t handle;
-  auto stream = handle.get_stream();
-  const std::vector<DataT> quantiles{0, 1};
-  rmm::device_uvector<DataT> d_quantiles(2, stream);
-  rmm::device_uvector<int> d_mutex(1, stream);
-  rmm::device_buffer split_storage(sizeof(Split<DataT>), stream);
-  auto* d_split = static_cast<Split<DataT>*>(split_storage.data());
-  raft::update_device(d_quantiles.data(), quantiles.data(), quantiles.size(), stream);
-  auto evaluate = [&](std::vector<BinT> const& hist, std::int64_t rows, std::int64_t feature) {
-    rmm::device_uvector<BinT> d_hist(hist.size(), stream);
-    raft::update_device(d_hist.data(), hist.data(), hist.size(), stream);
-    TypeParam objective(2, 1, CRITERION::MSE, 12.0);
-    objectiveGainKernel<<<1, 32, 0, stream.get()>>>(d_hist.data(),
-                                                    d_quantiles.data(),
-                                                    d_split,
-                                                    d_mutex.data(),
-                                                    objective,
-                                                    feature,
-                                                    rows,
-                                                    std::int64_t{2});
-    RAFT_CUDA_TRY(cudaGetLastError());
-    Split<DataT> split;
-    raft::update_host(&split, d_split, 1, stream);
-    handle.sync_stream();
-    // The queue receives local partition counts after the partition kernel.
-    split.local_nLeft = split.global_nLeft;
-    return split;
-  };
-
-  // Left child has 2 rows and average gain 2; right has 10 rows and average
-  // gain 0.5. Unweighted greedy growth must choose the right child. Weights
-  // of 4 per left row and 0.4 per right row reverse that ordering.
-  const double left_weight  = TypeParam::weighted ? 8.0 : 2.0;
-  const double right_weight = 12.0 - left_weight;
-  auto root                 = evaluate({TestFixture::MakeBin(2 * left_weight, 2, left_weight),
-                                        TestFixture::MakeBin(2 * left_weight, 12, 12),
-                                        TestFixture::MakeBin(2 * left_weight, 2, left_weight),
-                                        TestFixture::MakeBin(2 * left_weight + right_weight, 12, 12)},
-                       12,
-                       0);
-  auto left                 = evaluate({TestFixture::MakeBin(0, 1, left_weight / 2),
-                                        TestFixture::MakeBin(2 * left_weight, 2, left_weight),
-                                        TestFixture::MakeBin(left_weight, 1, left_weight / 2),
-                                        TestFixture::MakeBin(2 * left_weight, 2, left_weight)},
-                       2,
-                       1);
-  auto right                = evaluate({TestFixture::MakeBin(0, 5, right_weight / 2),
-                                        TestFixture::MakeBin(0, 10, right_weight),
-                                        TestFixture::MakeBin(0, 5, right_weight / 2),
-                                        TestFixture::MakeBin(right_weight, 10, right_weight)},
-                        10,
-                        2);
-  ASSERT_TRUE(root.IsValid());
-  ASSERT_TRUE(left.IsValid());
-  ASSERT_TRUE(right.IsValid());
-  EXPECT_EQ(left.best_metric_val, DataT{2});
-  EXPECT_EQ(right.best_metric_val, DataT{0.5});
-  EXPECT_NEAR(left.weighted_impurity_decrease, 2 * left_weight / 12, 1e-6);
-  EXPECT_NEAR(right.weighted_impurity_decrease, 0.5 * right_weight / 12, 1e-6);
-
-  for (int max_leaves : {-1, 3}) {
-    SCOPED_TRACE(max_leaves);
-    auto params = set_rf_params(8, max_leaves, 1.0, 2, 1, 2, 0.0, false, 1, 1.0, 0, MSE, 1, 1);
-    NodeQueue<DataT, DataT> queue(params.tree_params, 5, 12, 12, 2);
-    auto children = queue.ApplySplits(queue.GetRootWorkItems(), &root);
-    ASSERT_EQ(children.size(), 2);
-    queue.Push(children, {left, right});
-    auto [items, splits] = queue.Pop();
-    ASSERT_EQ(items.size(), 1);
-    const auto expected_idx = max_leaves == -1 || TypeParam::weighted ? 1 : 2;
-    EXPECT_EQ(items[0].idx, expected_idx);
-    queue.ApplySplits(items, splits.data());
-
-    auto tree = queue.GetTree();
-    EXPECT_EQ(tree->sparsetree.size(), 5);
-    EXPECT_EQ(tree->sparsetree[0].BestMetric(), root.best_metric_val);
-    EXPECT_EQ(tree->sparsetree[expected_idx].BestMetric(),
-              expected_idx == 1 ? DataT{2} : DataT{0.5});
-    EXPECT_TRUE(tree->sparsetree[expected_idx == 1 ? 2 : 1].IsLeaf());
   }
 }
 

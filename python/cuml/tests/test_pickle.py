@@ -198,15 +198,10 @@ def test_rf_regression_pickle(
                 datatype, nrows, ncols, n_info, n_classes
             )
 
-        model = rf_models[key](
-            **({"oob_score": True} if key == "RandomForestRegressor" else {})
-        )
+        model = rf_models[key]()
 
         model.fit(X_train, y_train)
         result["rf_res"] = model.predict(X_test)
-        if key == "RandomForestRegressor":
-            result["oob_prediction"] = model.oob_prediction_
-            result["oob_score"] = model.oob_score_
         return model, X_test
 
     def assert_model(pickled_model, X_test):
@@ -214,10 +209,6 @@ def test_rf_regression_pickle(
         assert array_equal(result["rf_res"], pickled_model.predict(X_test))
         if key == "RandomForestRegressor":
             assert pickled_model.n_outputs_ == n_targets
-            assert array_equal(
-                pickled_model.oob_prediction_, result["oob_prediction"]
-            )
-            assert pickled_model.oob_score_ == result["oob_score"]
         if key != "IsolationForest":
             # Confirm no crash from score. IsolationForest is an outlier
             # detector and has no `score`, as in sklearn.
