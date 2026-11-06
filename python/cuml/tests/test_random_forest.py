@@ -8,6 +8,7 @@ import os
 import random
 import warnings
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import cudf
 import cupy as cp
@@ -1789,6 +1790,48 @@ def test_rf_oob_score_regressor(
         assert (~valid).any()
     else:
         assert valid.all()
+
+
+@pytest.mark.parametrize("no_local_oob", [False, True])
+def test_rf_distributed_oob_target_scores(no_local_oob, monkeypatch):
+    # Model two ranks: one contributes both OOB rows, the other contributes none.
+    # Targets exercise perfect constants, ordinary R², and imperfect constants.
+    y = cp.array([[7, 2, 9], [7, 8, 9]], dtype=cp.float32)
+    predictions = cp.array([[[7, 4, 10]], [[7, 6, 10]]], dtype=cp.float32)
+    model = curfr(n_estimators=1)
+    model.n_outputs_ = 3
+    model._raft_handle = object()
+    monkeypatch.setattr(
+        model,
+        "_get_inference_nvforest_model",
+        lambda: SimpleNamespace(predict_per_tree=lambda X: predictions),
+    )
+    global_stats = [
+        cp.array([14, 10, 18, 2], dtype=cp.float64),
+        cp.array([[0, 8, 2], [0, 18, 0]], dtype=cp.float64),
+    ]
+    calls = 0
+
+    def allreduce(local_stats):
+        nonlocal calls
+        expected = global_stats[calls]
+        assert array_equal(
+            local_stats, cp.zeros_like(expected) if no_local_oob else expected
+        )
+        calls += 1
+        return expected
+
+    monkeypatch.setattr(model, "_allreduce_oob_stats", allreduce)
+    masks = cp.full((1, 2), no_local_oob, dtype=cp.bool_)
+    warning = (
+        pytest.warns(UserWarning, match="Some inputs do not have OOB scores")
+        if no_local_oob
+        else nullcontext()
+    )
+    with warning:
+        model._compute_oob_score(cp.zeros((2, 1)), y, masks)
+    assert calls == 2
+    assert model.oob_score_ == pytest.approx((1 + (1 - 8 / 18) + 0) / 3)
 
 
 def test_rf_oob_score_disabled():

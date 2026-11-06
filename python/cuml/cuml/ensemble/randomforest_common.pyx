@@ -750,15 +750,14 @@ class BaseRandomForestModel(InteropMixin, Base):
         """
         # Get per-tree predictions using nvForest
         nvforest_model = self._get_inference_nvforest_model()
-        # Per tree predictions shape: (n_samples, n_trees) for regression
-        #                          or (n_samples, n_trees, n_classes) for classification
+        # Per-tree predictions have an extra output dimension for vector
+        # regression and classification, but not for scalar regression.
         per_tree_preds = nvforest_model.predict_per_tree(X)
 
         n_samples = X.shape[0]
 
         # Determine output shape based on prediction dimensionality
-        # For regression: (n_samples,)
-        # For classification: (n_samples, n_classes)
+        # Preserve any target/class dimension after the tree dimension.
         output_shape = (n_samples,) + per_tree_preds.shape[2:]
         oob_predictions = cp.zeros(output_shape, dtype=cp.float64, order="C")
         oob_counts = cp.zeros(n_samples, dtype=cp.int32, order="C")
@@ -822,25 +821,26 @@ class BaseRandomForestModel(InteropMixin, Base):
                     r2_score(y_valid, predictions_valid)
                 )
             else:
-                y_valid = y_valid.astype(cp.float64, copy=False)
-                local_mean_stats = cp.empty(2, dtype=cp.float64)
-                local_mean_stats[0] = y_valid.sum()
-                local_mean_stats[1] = y_valid.size
+                y_valid = y_valid.astype(cp.float64, copy=False).reshape(
+                    -1, self.n_outputs_
+                )
+                predictions_valid = predictions_valid.reshape(-1, self.n_outputs_)
+                # Reduce target sums and the number of valid rows, not elements.
+                local_mean_stats = cp.empty(self.n_outputs_ + 1, dtype=cp.float64)
+                local_mean_stats[:-1] = y_valid.sum(axis=0)
+                local_mean_stats[-1] = y_valid.shape[0]
                 mean_stats = self._allreduce_oob_stats(local_mean_stats)
-                global_mean = mean_stats[0] / mean_stats[1]
-                local_score_stats = cp.empty(2, dtype=cp.float64)
-                local_score_stats[0] = cp.sum(
-                    (y_valid - predictions_valid) ** 2
-                )
-                local_score_stats[1] = cp.sum(
-                    (y_valid - global_mean) ** 2
-                )
+                global_mean = mean_stats[:-1] / cp.maximum(mean_stats[-1], 1)
+                local_score_stats = cp.stack((
+                    cp.sum((y_valid - predictions_valid) ** 2, axis=0),
+                    cp.sum((y_valid - global_mean) ** 2, axis=0),
+                ))
                 score_stats = self._allreduce_oob_stats(local_score_stats)
-                if score_stats[0] == 0:
-                    self.oob_score_ = 1.0
-                elif score_stats[1] == 0:
-                    self.oob_score_ = 0.0
-                else:
-                    self.oob_score_ = float(
-                        1 - score_stats[0] / score_stats[1]
-                    )
+                numerator, denominator = score_stats
+                # Match r2_score(force_finite=True) independently for each target.
+                scores = cp.ones(self.n_outputs_, dtype=cp.float64)
+                nonzero_error = numerator != 0
+                valid_score = nonzero_error & (denominator != 0)
+                scores[valid_score] = 1 - numerator[valid_score] / denominator[valid_score]
+                scores[nonzero_error & (denominator == 0)] = 0.0
+                self.oob_score_ = float(scores.mean())
