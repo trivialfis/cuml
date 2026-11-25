@@ -12,7 +12,7 @@ template <typename DataT>
 struct Quantiles {
   /** quantiles computed for each feature of dataset in col-major */
   DataT* quantiles_array;
-  /** The number of bins used for quantiles of each feature*/
+  /** The number of distinct thresholds per feature; zero when all values are NaN.*/
   int* n_bins_array;
 };
 

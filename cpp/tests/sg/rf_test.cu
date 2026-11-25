@@ -54,6 +54,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <random>
 #include <tuple>
 #include <type_traits>
@@ -1199,6 +1200,51 @@ class RFSampledQuantileExactFallbackTest : public ::testing::TestWithParam<Quant
   }
 };
 
+TEST(RFSampledQuantileTest, RetainsLowestPrioritiesAmongObservedRows)
+{
+  raft::handle_t handle;
+  constexpr int n_rows = 1024;
+  constexpr int n_bins = 16;
+  const auto nan       = std::numeric_limits<float>::quiet_NaN();
+
+  // With one sample per bin and distinct values, every retained row appears as a threshold.
+  std::vector<int> expected;
+  for (int row = 0; row < n_rows; row += 8) {
+    expected.push_back(row);
+  }
+  std::sort(expected.begin(), expected.end(), [](int a, int b) {
+    return DT::detail::samplePriority(0, 0, a) < DT::detail::samplePriority(0, 0, b);
+  });
+  expected.resize(n_bins);
+  std::sort(expected.begin(), expected.end());
+
+  for (bool row_major : {false, true}) {
+    std::vector<float> matrix(n_rows * 3, nan);
+    auto at = [&](int row, int col) -> float& {
+      return matrix[row_major ? row * 3 + col : col * n_rows + row];
+    };
+    for (int row = 0; row < n_rows; row += 8) {
+      at(row, 0) = float(row);
+    }
+    at(1, 1)          = -7.0f;
+    at(n_rows - 1, 1) = 3.0f;
+    thrust::device_vector<float> data(matrix);
+    auto result =
+      DT::computeQuantiles(handle, data.data().get(), n_bins, n_rows, 3, 1, 0, row_major);
+    std::array<int, 3> counts;
+    std::array<float, n_bins * 3> quantiles;
+    raft::update_host(
+      counts.data(), result.n_bins_array.data(), counts.size(), handle.get_stream());
+    raft::update_host(
+      quantiles.data(), result.quantiles_array.data(), quantiles.size(), handle.get_stream());
+    handle.sync_stream();
+    ASSERT_EQ(counts, (std::array<int, 3>{n_bins, 2, 0}));
+    EXPECT_TRUE(std::equal(expected.begin(), expected.end(), quantiles.begin()));
+    EXPECT_EQ(quantiles[n_bins], -7.0f);
+    EXPECT_EQ(quantiles[n_bins + 1], 3.0f);
+  }
+}
+
 template <typename T>
 class RFSampledQuantileDeterminismTest : public ::testing::TestWithParam<QuantileTestParameters> {
  public:
@@ -1432,33 +1478,23 @@ const std::vector<QuantileTestParameters> inputs = {{1000, 16, 60785875197640796
 const std::vector<QuantileTestParameters> rank_error_inputs = {
   {10000, 128, 9507819643927052255LLU}};
 
-// Check that all possible global samples can be selected, including the
-// one-row partition when drawing a single sample from {1, 9} rows.
-TEST(RFSampledQuantileGlobalSamplingTest, SmallPartitionCanReceiveSingleSample)
+TEST(RFSampledQuantileTest, SingleDrawCanSelectEveryRow)
 {
-  std::vector<std::uint64_t> rank_row_offsets{0, 1, 10};
-  constexpr std::uint64_t global_rows = 10;
+  raft::handle_t handle;
+  constexpr int n_rows = 10;
+  thrust::device_vector<float> data(n_rows);
+  thrust::sequence(data.begin(), data.end());
 
-  bool sampled_small_rank = false;
-  for (std::uint64_t seed = 0; seed < 4096 && !sampled_small_rank; ++seed) {
-    raft::random::UniformIntDistParams<std::uint64_t, std::uint64_t> uniform_int_dist_params;
-    uniform_int_dist_params.start = 0;
-    uniform_int_dist_params.end   = global_rows;
-    uniform_int_dist_params.diff  = global_rows;
-    raft::random::PCGenerator gen(seed, uint64_t{0}, uint64_t{0});
-    std::uint64_t global_row;
-    raft::random::custom_next(
-      gen, &global_row, uniform_int_dist_params, std::uint64_t{0}, std::uint64_t{0});
-
-    auto sample_rank =
-      std::lower_bound(rank_row_offsets.begin() + 1, rank_row_offsets.end(), global_row + 1) -
-      (rank_row_offsets.begin() + 1);
-    ASSERT_LT(sample_rank + 1, rank_row_offsets.size());
-    sampled_small_rank = sample_rank == 0;
+  std::array<bool, n_rows> seen{};
+  for (std::uint64_t seed = 0; seed < 256; ++seed) {
+    auto result = DT::computeQuantiles(handle, data.data().get(), 1, n_rows, 1, 1, seed);
+    auto row    = static_cast<int>(result.quantiles_array.element(0, handle.get_stream()));
+    ASSERT_GE(row, 0);
+    ASSERT_LT(row, n_rows);
+    seen[row] = true;
+    if (std::all_of(seen.begin(), seen.end(), [](bool x) { return x; })) { return; }
   }
-
-  ASSERT_TRUE(sampled_small_rank)
-    << "A one-row partition should be reachable when drawing one global sample.";
+  FAIL() << "Some rows were never selected.";
 }
 
 // float type quantile test

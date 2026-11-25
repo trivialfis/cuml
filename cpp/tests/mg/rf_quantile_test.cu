@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <type_traits>
 #include <vector>
@@ -122,7 +123,7 @@ class RfMgQuantileTest : public ::testing::Test {
     raft::handle_t handle(cuda::stream_ref{cudaStreamPerThread}, stream_pool);
     raft::comms::initialize_mpi_comms(&handle, MPI_COMM_WORLD);
 
-    constexpr int n_cols         = 3;
+    constexpr int n_cols         = 4;
     constexpr int max_n_bins     = 16;
     constexpr int oversample     = 4;
     constexpr std::uint64_t seed = 123456789ULL;
@@ -134,6 +135,14 @@ class RfMgQuantileTest : public ::testing::Test {
         h_data[static_cast<std::size_t>(col) * n_rows + row] =
           static_cast<T>(col * 100000 + rank * 1000 + row + 1);
       }
+    }
+
+    // Exercise unequal observed counts, a feature confined to one rank, and an empty feature.
+    const auto nan = std::numeric_limits<T>::quiet_NaN();
+    for (int row = 0; row < n_rows; ++row) {
+      if (row % (rank + 2) != 0) { h_data[n_rows + row] = nan; }
+      if (rank != size - 1 || row > 1) { h_data[2 * n_rows + row] = nan; }
+      h_data[3 * n_rows + row] = nan;
     }
 
     rmm::device_uvector<T> data(h_data.size(), handle.get_stream());
@@ -187,8 +196,11 @@ class RfMgQuantileTest : public ::testing::Test {
 
     // Compare against a single-GPU reference so the test checks correctness, not just rank
     // agreement.
+    ASSERT_GT(h_n_bins[0], 1);
+    ASSERT_GT(h_n_bins[1], 1);
+    ASSERT_EQ(h_n_bins[2], 2);
+    ASSERT_EQ(h_n_bins[3], 0);
     for (int col = 0; col < n_cols; ++col) {
-      ASSERT_GT(h_n_bins[col], 1);
       ASSERT_LE(h_n_bins[col], max_n_bins);
       ASSERT_EQ(h_n_bins[col], h_reference_n_bins[col]);
       for (int bin = 0; bin < h_n_bins[col]; ++bin) {

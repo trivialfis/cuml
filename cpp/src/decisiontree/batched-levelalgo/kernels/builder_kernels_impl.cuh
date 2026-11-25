@@ -366,6 +366,7 @@ CUML_KERNEL void buildHistogramsKernel(typename ObjectiveT::BinT* histograms,
   std::int64_t colIndex = colStart + blockIdx.y;
   std::int64_t col      = column_samples[nid * dataset.n_sampled_cols + colIndex];
   int n_bins            = quantiles.n_bins_array[col];
+  if (n_bins == 0) { return; }
 
   auto n_classes            = objective.NumClasses();
   auto end                  = range_start + range_len;
@@ -436,6 +437,7 @@ CUML_KERNEL void findBestSplitsKernel(typename ObjectiveT::BinT* histograms,
   std::int64_t colIndex = colStart + blockIdx.y;
   std::int64_t col      = column_samples[nid * dataset.n_sampled_cols + colIndex];
   int n_bins            = quantiles.n_bins_array[col];
+  if (n_bins == 0) { return; }
 
   auto n_classes            = objective.NumClasses();
   auto histograms_offset    = (std::size_t(nid) * gridDim.y + blockIdx.y) * max_n_bins * n_classes;

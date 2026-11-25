@@ -16,7 +16,6 @@
 #include <raft/core/handle.hpp>
 #include <raft/core/nvtx.hpp>
 #include <raft/core/resource/comms.hpp>
-#include <raft/random/rng_device.cuh>
 #include <raft/util/cuda_utils.cuh>
 
 #include <rmm/device_uvector.hpp>
@@ -26,56 +25,97 @@
 #include <cub/device/device_segmented_radix_sort.cuh>
 #include <cuda/memory_resource>  // for get_memory_resource
 #include <cuda/std/algorithm>
+#include <cuda/std/cmath>
 #include <cuda/std/execution>  // for env, prop
+#include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
-#include <thrust/scan.h>
+#include <thrust/transform.h>
 #include <thrust/unique.h>
 
 #include <algorithm>
 #include <cstddef>  // for size_t
 #include <cstdint>
+#include <limits>
+#include <numeric>
 #include <utility>
+#include <vector>
 
 namespace ML {
 namespace DT {
 
 namespace detail {
 
-// Draw global sample rows and copy values owned by this rank into a column-major sample buffer.
-template <typename T, typename Layout>
-CUML_KERNEL void sampleOwnedColumnsKernel(
-  T* out,
-  raft::device_matrix_view<const T, std::size_t, Layout> data,
-  const std::uint64_t* rank_row_offsets,
-  int comm_size,
-  std::uint64_t global_rows,
-  int sample_count,
-  int rank,
-  std::uint64_t seed)
+template <typename T>
+struct PrioritySample {
+  std::uint64_t priority;
+  T value;
+
+  __host__ __device__ bool operator<(const PrioritySample& other) const
+  { return priority < other.priority; }
+};
+
+// SplitMix64's bijective finalizer gives each global row a distinct priority within a feature.
+__host__ __device__ inline std::uint64_t mixPriority(std::uint64_t x)
 {
-  int col        = blockIdx.x;
-  int sample_idx = blockIdx.y * blockDim.x + threadIdx.x;
-  if (sample_idx >= sample_count) { return; }
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
 
-  std::uint64_t global_row = sample_idx;
-  if (static_cast<std::uint64_t>(sample_count) != global_rows) {
-    raft::random::UniformIntDistParams<std::uint64_t, std::uint64_t> uniform_int_dist_params;
-    uniform_int_dist_params.start = 0;
-    uniform_int_dist_params.end   = global_rows;
-    uniform_int_dist_params.diff  = global_rows;
-    raft::random::PCGenerator gen(seed, static_cast<uint64_t>(sample_idx), uint64_t(0));
-    raft::random::custom_next(
-      gen, &global_row, uniform_int_dist_params, std::uint64_t(0), std::uint64_t(0));
+__host__ __device__ inline std::uint64_t samplePriority(std::uint64_t seed,
+                                                        unsigned col,
+                                                        std::uint64_t global_row)
+{
+  const auto salt = mixPriority(seed + (std::uint64_t(col) + 1) * 0x9e3779b97f4a7c15ULL);
+  return mixPriority(global_row ^ salt);
+}
+
+// One block per feature. Threads read the input once and reject candidates above the current
+// cutoff in parallel. Only qualifying entries visit the bounded max-heap.
+template <int Threads, typename T, typename ReadSample>
+CUML_KERNEL void retainLowestPriorities(
+  PrioritySample<T>* samples, int* counts, int capacity, int n_rows, ReadSample read_sample)
+{
+  auto col   = blockIdx.x;
+  auto* heap = samples + std::size_t(col) * capacity;
+  __shared__ PrioritySample<T> candidates[Threads];
+  __shared__ int size;
+  __shared__ std::uint64_t cutoff;
+  if (threadIdx.x == 0) {
+    size   = counts[col];
+    cutoff = size == capacity ? heap[0].priority : UINT64_MAX;
   }
-
-  auto sample_end = ::cuda::std::lower_bound(
-    rank_row_offsets + 1, rank_row_offsets + comm_size + 1, global_row + 1);
-  int sample_rank           = static_cast<int>(sample_end - (rank_row_offsets + 1));
-  std::uint64_t local_begin = rank_row_offsets[rank];
-  if (sample_rank == rank) {
-    auto local_row                                                 = global_row - local_begin;
-    out[static_cast<std::size_t>(col) * sample_count + sample_idx] = data(local_row, col);
+  __syncthreads();
+  for (std::int64_t start = 0; start < n_rows; start += Threads) {
+    auto row = start + threadIdx.x;
+    PrioritySample<T> candidate{0, std::numeric_limits<T>::quiet_NaN()};
+    if (row < n_rows) { candidate = read_sample(static_cast<int>(row), col); }
+    bool eligible = !::cuda::std::isnan(candidate.value) && candidate.priority <= cutoff;
+    if (!eligible) { candidate.value = std::numeric_limits<T>::quiet_NaN(); }
+    candidates[threadIdx.x] = candidate;
+    if (__syncthreads_or(eligible)) {
+      if (threadIdx.x == 0) {
+        for (const auto& entry : candidates) {
+          if (::cuda::std::isnan(entry.value)) { continue; }
+          if (size < capacity) {
+            heap[size++] = entry;
+            if (size == capacity) { ::cuda::std::make_heap(heap, heap + size); }
+          } else if (entry.priority < heap[0].priority) {
+            ::cuda::std::pop_heap(heap, heap + size);
+            heap[size - 1] = entry;
+            ::cuda::std::push_heap(heap, heap + size);
+          }
+        }
+        if (size == capacity) { cutoff = heap[0].priority; }
+      }
+      __syncthreads();
+    }
+  }
+  if (threadIdx.x == 0) { counts[col] = size; }
+  // A peer can merge this fixed-size buffer directly, including underfull and empty samples.
+  for (std::int64_t i = std::int64_t(size) + threadIdx.x; i < capacity; i += Threads) {
+    heap[i] = {0, std::numeric_limits<T>::quiet_NaN()};
   }
 }
 
@@ -84,11 +124,18 @@ CUML_KERNEL void sampleOwnedColumnsKernel(
 // Convert sorted per-column samples into quantile candidates and compact duplicate candidates.
 template <typename T>
 CUML_KERNEL void computeQuantilesBatchedKernel(
-  T* quantiles, int* n_bins, const T* sorted_data, const int max_n_bins, const int sample_count)
+  T* quantiles, int* n_bins, const T* sorted_data, const int max_n_bins, int sample_stride)
 {
   int col           = blockIdx.x;
   T* col_quantiles  = quantiles + static_cast<int64_t>(col) * max_n_bins;
-  const T* col_data = sorted_data + static_cast<int64_t>(col) * sample_count;
+  auto sample_count = n_bins[col];
+  if (sample_count == 0) {
+    for (int bin = threadIdx.x; bin < max_n_bins; bin += blockDim.x) {
+      col_quantiles[bin] = T{0};
+    }
+    return;
+  }
+  const T* col_data = sorted_data + std::size_t(col) * sample_stride;
   double bin_width  = static_cast<double>(sample_count) / max_n_bins;
 
   for (int bin = threadIdx.x; bin < max_n_bins; bin += blockDim.x) {
@@ -124,9 +171,9 @@ struct QuantileResult {
 /**
  * @brief Compute per-feature quantile split candidates from uniformly sampled rows.
  *
- * A deterministic global row sample is drawn once with replacement and shared across
- * feature columns. When the requested sample budget covers the global row count, all
- * rows are used.
+ * Each feature retains the lowest random priorities among its non-NaN rows across all ranks.
+ * Global row IDs make the sample independent of rank boundaries. Sampling is without replacement.
+ * If the budget covers all observed values, each is used once. An all-NaN feature has zero bins.
  *
  * @tparam T Floating-point input type.
  * @param handle RAFT handle used for stream and resource access.
@@ -165,103 +212,109 @@ CUML_EXPORT QuantileResult<T> computeQuantiles(const raft::handle_t& handle,
   int rank      = distributed ? handle.get_comms().get_rank() : 0;
   int comm_size = distributed ? handle.get_comms().get_size() : 1;
 
-  // Build exclusive global row offsets so sampled global row ids can be mapped to owning ranks.
-  rmm::device_uvector<std::uint64_t> rank_row_offsets(comm_size + 1, stream);
-  rmm::device_uvector<std::uint64_t> local_row_count(1, stream);
-  auto local_rows = static_cast<std::uint64_t>(n_rows);
-  RAFT_CUDA_TRY(cudaMemsetAsync(rank_row_offsets.data(), 0, sizeof(std::uint64_t), stream));
-  raft::update_device(local_row_count.data(), &local_rows, 1, stream);
-
+  std::uint64_t first_row   = 0;
+  std::uint64_t global_rows = n_rows;
   if (distributed) {
-    // Gather each rank's local row count so global row ids can be mapped back to rank-local rows.
-    handle.get_comms().allgather(local_row_count.data(), rank_row_offsets.data() + 1, 1, stream);
+    rmm::device_uvector<int> local_rows(1, stream);
+    rmm::device_uvector<int> gathered(comm_size, stream);
+    raft::update_device(local_rows.data(), &n_rows, 1, stream);
+    handle.get_comms().allgather(local_rows.data(), gathered.data(), 1, stream);
+    std::vector<int> rows(comm_size);
+    raft::update_host(rows.data(), gathered.data(), rows.size(), stream);
     ASSERT(handle.get_comms().sync_stream(stream) == raft::comms::status_t::SUCCESS,
-           "An error occurred in the distributed RF quantile row-count all-gather.");
-  } else {
-    raft::copy(rank_row_offsets.data() + 1, local_row_count.data(), 1, stream);
+           "An error occurred gathering RF quantile row counts.");
+    first_row   = std::accumulate(rows.begin(), rows.begin() + rank, std::uint64_t{0});
+    global_rows = std::accumulate(rows.begin() + rank, rows.end(), first_row);
   }
-  thrust::inclusive_scan(rmm::exec_policy(stream),
-                         rank_row_offsets.data(),
-                         rank_row_offsets.data() + comm_size + 1,
-                         rank_row_offsets.data());
-  std::uint64_t global_rows;
-  raft::update_host(&global_rows, rank_row_offsets.data() + comm_size, 1, stream);
-  handle.sync_stream(stream);
   RAFT_EXPECTS(global_rows > 0, "global row count must be positive");
-
-  // Allocate one shared row sample for all columns and the buffers used to sort it by column.
-  int sample_count = ML::narrow_cast<int>(std::min<std::uint64_t>(
-    global_rows, ML::checked_mul<std::uint64_t>(max_n_bins, oversampling_factor)));
-
-  std::size_t total_sample_values = ML::checked_mul<std::size_t>(sample_count, n_cols);
-  rmm::device_uvector<T> sampled_columns(total_sample_values, stream);
-  rmm::device_uvector<T> sorted_samples(total_sample_values, stream);
-
-  int n_threads        = 256;
-  auto segment_offsets = thrust::make_transform_iterator(
-    thrust::make_counting_iterator<std::int64_t>(0),
-    [sample_count] __host__ __device__(std::int64_t col) { return col * sample_count; });
-  rmm::device_uvector<T> quantiles_array(ML::checked_mul<std::size_t>(n_cols, max_n_bins), stream);
+  auto budget       = ML::checked_mul<std::uint64_t>(max_n_bins, oversampling_factor);
+  int capacity      = ML::narrow_cast<int>(std::min(global_rows, budget));
+  auto sample_slots = ML::checked_mul<std::size_t>(n_cols, capacity);
+  using Sample      = detail::PrioritySample<T>;
+  rmm::device_uvector<Sample> samples(sample_slots, stream);
   rmm::device_uvector<int> n_bins_array(n_cols, stream);
+  rmm::device_uvector<T> quantiles_array(ML::checked_mul<std::size_t>(n_cols, max_n_bins), stream);
+  RAFT_CUDA_TRY(cudaMemsetAsync(n_bins_array.data(), 0, sizeof(int) * std::size_t(n_cols), stream));
 
-  // Fill this rank's owned positions in the global sample; all other positions remain zero.
-  RAFT_CUDA_TRY(cudaMemsetAsync(sampled_columns.data(),
-                                0,
-                                ML::checked_mul<std::size_t>(sizeof(T), total_sample_values),
-                                stream));
-  dim3 sample_grid(n_cols, (sample_count + n_threads - 1) / n_threads);
-  auto launch_sample = [&](auto input) {
-    detail::sampleOwnedColumnsKernel<<<sample_grid, n_threads, 0, stream>>>(sampled_columns.data(),
-                                                                            input,
-                                                                            rank_row_offsets.data(),
-                                                                            comm_size,
-                                                                            global_rows,
-                                                                            sample_count,
-                                                                            rank,
-                                                                            seed);
+  auto input = row_major
+                 ? raft::make_device_strided_matrix_view<const T, std::size_t, raft::row_major>(
+                     data, n_rows, n_cols, n_cols)
+                 : raft::make_device_strided_matrix_view<const T, std::size_t, raft::col_major>(
+                     data, n_rows, n_cols, std::max(n_rows, 1));
+  auto from_input = [=] __device__(int row, unsigned col) {
+    return Sample{detail::samplePriority(seed, col, first_row + row), input(row, col)};
   };
-  if (row_major) {
-    launch_sample(
-      raft::make_device_matrix_view<const T, std::size_t, raft::row_major>(data, n_rows, n_cols));
-  } else {
-    launch_sample(
-      raft::make_device_matrix_view<const T, std::size_t, raft::col_major>(data, n_rows, n_cols));
-  }
+  constexpr int threads = 128;
+  detail::retainLowestPriorities<threads><<<n_cols, threads, 0, stream>>>(
+    samples.data(), n_bins_array.data(), capacity, n_rows, from_input);
   RAFT_CUDA_TRY(cudaGetLastError());
+
   if (distributed) {
-    // Every global sample position is owned by exactly one rank. A SUM all-reduce turns the sparse
-    // per-rank buffers into the same dense sample buffer on all ranks without per-column gathers or
-    // rank-dependent counts/displacements.
-    handle.get_comms().allreduce(sampled_columns.data(),
-                                 sampled_columns.data(),
-                                 total_sample_values,
-                                 raft::comms::op_t::SUM,
-                                 stream);
-    ASSERT(handle.get_comms().sync_stream(stream) == raft::comms::status_t::SUCCESS,
-           "An error occurred in the distributed RF quantile sample all-reduce.");
+    // Reduce up a binary tree. A receiver merges one peer's K candidates per feature at a time.
+    const auto& comms = handle.get_comms();
+    rmm::device_uvector<Sample> peer(rank % 2 == 0 && rank + 1 < comm_size ? sample_slots : 0,
+                                     stream);
+    for (std::int64_t stride = 1; stride < comm_size; stride *= 2) {
+      if (rank & stride) {
+        comms.device_send(samples.data(), samples.size(), int(rank - stride), stream);
+        break;
+      }
+      if (rank + stride < comm_size) {
+        // An unpaired last rank only sends at a later level; all receivers have scratch.
+        comms.device_recv(peer.data(), peer.size(), int(rank + stride), stream);
+        auto from_peer = [ptr = peer.data(), capacity] __device__(int row, unsigned col) {
+          return ptr[std::size_t(col) * capacity + row];
+        };
+        detail::retainLowestPriorities<threads><<<n_cols, threads, 0, stream>>>(
+          samples.data(), n_bins_array.data(), capacity, capacity, from_peer);
+        RAFT_CUDA_TRY(cudaGetLastError());
+      }
+    }
   }
 
-  // Sort each feature column's sampled values as an independent segment in one batched call.
-  auto sort_env = cuda::std::execution::env{
-    handle.get_stream(),
-    cuda::std::execution::prop{cuda::mr::get_memory_resource,
-                               rmm::mr::get_current_device_resource_ref()}};
-  RAFT_CUDA_TRY(
-    cub::DeviceSegmentedRadixSort::SortKeys(sampled_columns.data(),
-                                            sorted_samples.data(),
-                                            static_cast<std::int64_t>(total_sample_values),
-                                            static_cast<std::int64_t>(n_cols),
-                                            segment_offsets,
-                                            segment_offsets + 1,
-                                            0,
-                                            8 * sizeof(T),
-                                            sort_env));
-
-  // Interpolate quantile positions from the sorted samples and record the non-duplicate bin count.
-  computeQuantilesBatchedKernel<<<n_cols, std::min(1024, max_n_bins), 0, stream>>>(
-    quantiles_array.data(), n_bins_array.data(), sorted_samples.data(), max_n_bins, sample_count);
-  RAFT_CUDA_TRY(cudaGetLastError());
-
+  if (rank == 0) {
+    // Sort only the occupied prefix of each feature's sample.
+    rmm::device_uvector<T> values(sample_slots, stream);
+    thrust::transform(rmm::exec_policy_nosync(stream),
+                      samples.begin(),
+                      samples.end(),
+                      values.begin(),
+                      [] __host__ __device__(Sample sample) { return sample.value; });
+    samples.release();  // Priorities can be freed before allocating sorting workspace.
+    rmm::device_uvector<T> sorted(sample_slots, stream);
+    auto columns = thrust::make_counting_iterator<std::int64_t>(0);
+    auto begins  = thrust::make_transform_iterator(
+      columns, [capacity] __host__ __device__(std::int64_t col) { return col * capacity; });
+    const int* sizes = n_bins_array.data();
+    auto ends        = thrust::make_transform_iterator(
+      columns, [capacity, sizes] __host__ __device__(std::int64_t col) {
+        return col * capacity + sizes[col];
+      });
+    auto env = cuda::std::execution::env{
+      handle.get_stream(),
+      cuda::std::execution::prop{cuda::mr::get_memory_resource,
+                                 rmm::mr::get_current_device_resource_ref()}};
+    RAFT_CUDA_TRY(
+      cub::DeviceSegmentedRadixSort::SortKeys(values.data(),
+                                              sorted.data(),
+                                              ML::narrow_cast<std::int64_t>(sample_slots),
+                                              static_cast<std::int64_t>(n_cols),
+                                              begins,
+                                              ends,
+                                              0,
+                                              8 * sizeof(T),
+                                              env));
+    computeQuantilesBatchedKernel<<<n_cols, std::min(1024, max_n_bins), 0, stream>>>(
+      quantiles_array.data(), n_bins_array.data(), sorted.data(), max_n_bins, capacity);
+    RAFT_CUDA_TRY(cudaGetLastError());
+  }
+  if (distributed) {
+    const auto& comms = handle.get_comms();
+    comms.bcast(quantiles_array.data(), quantiles_array.size(), 0, stream);
+    comms.bcast(n_bins_array.data(), n_bins_array.size(), 0, stream);
+    ASSERT(comms.sync_stream(stream) == raft::comms::status_t::SUCCESS,
+           "An error occurred distributing RF quantiles.");
+  }
   handle.sync_stream(stream);
 
   raft::common::nvtx::pop_range();
