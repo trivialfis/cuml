@@ -11,6 +11,7 @@
 #include <cuml/common/export.hpp>
 #include <cuml/common/utils.hpp>
 
+#include <raft/core/device_mdspan.hpp>  // for device_matrix_view
 #include <raft/core/error.hpp>
 #include <raft/core/handle.hpp>
 #include <raft/core/nvtx.hpp>
@@ -29,6 +30,7 @@
 #include <thrust/unique.h>
 
 #include <algorithm>
+#include <cstddef>  // for size_t
 #include <cstdint>
 #include <utility>
 
@@ -38,18 +40,16 @@ namespace DT {
 namespace detail {
 
 // Draw global sample rows and copy values owned by this rank into a column-major sample buffer.
-template <typename T>
-CUML_KERNEL void sampleOwnedColumnsKernel(T* out,
-                                          const T* data,
-                                          const std::uint64_t* rank_row_offsets,
-                                          int comm_size,
-                                          std::uint64_t global_rows,
-                                          int sample_count,
-                                          int rank,
-                                          int n_rows,
-                                          int n_cols,
-                                          bool row_major,
-                                          std::uint64_t seed)
+template <typename T, typename Layout>
+CUML_KERNEL void sampleOwnedColumnsKernel(
+  T* out,
+  raft::device_matrix_view<const T, std::size_t, Layout> data,
+  const std::uint64_t* rank_row_offsets,
+  int comm_size,
+  std::uint64_t global_rows,
+  int sample_count,
+  int rank,
+  std::uint64_t seed)
 {
   int col        = blockIdx.x;
   int sample_idx = blockIdx.y * blockDim.x + threadIdx.x;
@@ -71,10 +71,8 @@ CUML_KERNEL void sampleOwnedColumnsKernel(T* out,
   int sample_rank           = static_cast<int>(sample_end - (rank_row_offsets + 1));
   std::uint64_t local_begin = rank_row_offsets[rank];
   if (sample_rank == rank) {
-    int local_row = static_cast<int>(global_row - local_begin);
-    out[static_cast<std::size_t>(col) * sample_count + sample_idx] =
-      row_major ? data[static_cast<std::size_t>(local_row) * n_cols + col]
-                : data[static_cast<std::size_t>(col) * n_rows + local_row];
+    auto local_row                                                 = global_row - local_begin;
+    out[static_cast<std::size_t>(col) * sample_count + sample_idx] = data(local_row, col);
   }
 }
 
@@ -129,9 +127,7 @@ struct QuantileResult {
  *
  * @tparam T Floating-point input type.
  * @param handle RAFT handle used for stream and resource access.
- * @param data Input matrix. When `row_major` is false, data is column-major with
- * shape `[n_cols, n_rows]`; when `row_major` is true, data is row-major with
- * shape `[n_rows, n_cols]`.
+ * @param data Input matrix of shape `[n_rows, n_cols]` in the storage order given by `row_major`.
  * @param max_n_bins Maximum number of quantile candidates to retain per feature.
  * @param n_rows Number of local rows in `data` for this rank.
  * @param n_cols Number of columns in `data`.
@@ -211,17 +207,23 @@ CUML_EXPORT QuantileResult<T> computeQuantiles(const raft::handle_t& handle,
                                 ML::checked_mul<std::size_t>(sizeof(T), total_sample_values),
                                 stream));
   dim3 sample_grid(n_cols, (sample_count + n_threads - 1) / n_threads);
-  detail::sampleOwnedColumnsKernel<<<sample_grid, n_threads, 0, stream>>>(sampled_columns.data(),
-                                                                          data,
-                                                                          rank_row_offsets.data(),
-                                                                          comm_size,
-                                                                          global_rows,
-                                                                          sample_count,
-                                                                          rank,
-                                                                          n_rows,
-                                                                          n_cols,
-                                                                          row_major,
-                                                                          seed);
+  auto launch_sample = [&](auto input) {
+    detail::sampleOwnedColumnsKernel<<<sample_grid, n_threads, 0, stream>>>(sampled_columns.data(),
+                                                                            input,
+                                                                            rank_row_offsets.data(),
+                                                                            comm_size,
+                                                                            global_rows,
+                                                                            sample_count,
+                                                                            rank,
+                                                                            seed);
+  };
+  if (row_major) {
+    launch_sample(
+      raft::make_device_matrix_view<const T, std::size_t, raft::row_major>(data, n_rows, n_cols));
+  } else {
+    launch_sample(
+      raft::make_device_matrix_view<const T, std::size_t, raft::col_major>(data, n_rows, n_cols));
+  }
   RAFT_CUDA_TRY(cudaGetLastError());
   if (distributed) {
     // Every global sample position is owned by exactly one rank. A SUM all-reduce turns the sparse
