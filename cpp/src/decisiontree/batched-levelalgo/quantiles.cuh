@@ -21,9 +21,12 @@
 
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
+#include <rmm/mr/per_device_resource.hpp>  // for get_current_device_resource_ref
 
 #include <cub/device/device_segmented_radix_sort.cuh>
+#include <cuda/memory_resource>  // for get_memory_resource
 #include <cuda/std/algorithm>
+#include <cuda/std/execution>  // for env, prop
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/scan.h>
@@ -239,12 +242,12 @@ CUML_EXPORT QuantileResult<T> computeQuantiles(const raft::handle_t& handle,
   }
 
   // Sort each feature column's sampled values as an independent segment in one batched call.
-  size_t temp_storage_bytes = 0;
-  // Query temporary storage for the batched segmented radix sort.
+  auto sort_env = cuda::std::execution::env{
+    handle.get_stream(),
+    cuda::std::execution::prop{cuda::mr::get_memory_resource,
+                               rmm::mr::get_current_device_resource_ref()}};
   RAFT_CUDA_TRY(
-    cub::DeviceSegmentedRadixSort::SortKeys(nullptr,
-                                            temp_storage_bytes,
-                                            sampled_columns.data(),
+    cub::DeviceSegmentedRadixSort::SortKeys(sampled_columns.data(),
                                             sorted_samples.data(),
                                             static_cast<std::int64_t>(total_sample_values),
                                             static_cast<std::int64_t>(n_cols),
@@ -252,21 +255,7 @@ CUML_EXPORT QuantileResult<T> computeQuantiles(const raft::handle_t& handle,
                                             segment_offsets + 1,
                                             0,
                                             8 * sizeof(T),
-                                            stream));
-  rmm::device_uvector<char> d_temp_storage(temp_storage_bytes, stream);
-
-  RAFT_CUDA_TRY(
-    cub::DeviceSegmentedRadixSort::SortKeys((void*)(d_temp_storage.data()),
-                                            temp_storage_bytes,
-                                            sampled_columns.data(),
-                                            sorted_samples.data(),
-                                            static_cast<std::int64_t>(total_sample_values),
-                                            static_cast<std::int64_t>(n_cols),
-                                            segment_offsets,
-                                            segment_offsets + 1,
-                                            0,
-                                            8 * sizeof(T),
-                                            stream));
+                                            sort_env));
 
   // Interpolate quantile positions from the sorted samples and record the non-duplicate bin count.
   computeQuantilesBatchedKernel<<<n_cols, std::min(1024, max_n_bins), 0, stream>>>(
